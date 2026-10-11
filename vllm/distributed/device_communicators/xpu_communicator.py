@@ -22,6 +22,9 @@ logger = init_logger(__name__)
 # xpu_ram_relay.py. GroupCoordinator routes the pipeline hand-off through
 # send_tensor_dict/recv_tensor_dict when supports_tensor_dict is True.
 _RAM_RELAY = sys.platform == "win32"
+# with stats or tracing on, the GPU exchange is called through its Python wrapper (which counts and logs); otherwise
+# through one C++ call per layer
+_STATS_OR_TRACE = os.environ.get("VLLM_XPU_EXCHANGE_STATS") == "1" or os.environ.get("VLLM_XPU_EXCHANGE_TRACE") == "1"
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
@@ -155,10 +158,14 @@ class XpuCommunicator(DeviceCommunicatorBase):
                             self.rank_in_group, self.world_size, self.cpu_group, self.device
                         )
                 if self._exchange_kind == "gpu":
-                    if self._exchange.accepts(input_):
-                        # in place: GroupCoordinator.all_reduce documents that the input may be modified and the
-                        # return value is the output; the clone was one more Python op and kernel per layer
-                        return self._exchange.all_reduce(input_)
+                    # in place: GroupCoordinator.all_reduce documents that the input may be modified and the
+                    # return value is the output; the clone was one more Python op and kernel per layer. One C++ call
+                    # decides whether it takes the tensor (dtype, size, layout) - False means fall back below.
+                    if _STATS_OR_TRACE:
+                        if self._exchange.accepts(input_):
+                            return self._exchange.all_reduce(input_)
+                    elif self._exchange.try_all_reduce(input_):
+                        return input_
                 else:
                     nbytes = input_.numel() * input_.element_size()
                     if nbytes <= self._exchange.slot_bytes:

@@ -71,6 +71,15 @@ class GpuExchange:
         nbytes = t.numel() * t.element_size()
         return t.dtype in _DTYPES and nbytes <= self.slot_bytes and nbytes % 4 == 0
 
+    def try_all_reduce(self, t: torch.Tensor) -> bool:
+        """The hot path: one C++ call that checks dtype, size and layout itself and returns False (doing nothing) when
+        the tensor is not for the exchange. In place on success. Raises if an earlier exchange timed out (peer gone)."""
+        try:
+            return self.ext.try_all_reduce_(t)
+        except RuntimeError:
+            logger.error("xpu exchange state at failure: %s", self.ext.debug())
+            raise
+
     def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
         """In place; returns ``t``. Raises if an earlier exchange timed out (peer gone)."""
         t = t.contiguous()

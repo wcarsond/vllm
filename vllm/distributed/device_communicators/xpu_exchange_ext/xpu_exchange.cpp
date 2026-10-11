@@ -43,6 +43,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -58,7 +59,14 @@ constexpr int WG = 512;
 constexpr size_t SMALL = 64u << 10;            // one work-group per kernel up to here (data bytes)
 constexpr uint32_t SPIN_LIMIT = 6000000;       // polls per lane before it gives up: ~1 s at 150-180 ns a poll
                                                // (probe/poll-rate.cpp), under the 2 s Windows TDR default (TdrDelay unset)
-constexpr double HELPER_TIMEOUT_S = 60.0;
+// How long the host side waits for the peer before calling it gone. 600 s by default (VLLM_XPU_EXCHANGE_TIMEOUT_S):
+// the two workers compile their graphs independently when torch.compile is on, and one can be minutes ahead of the
+// other (11:30: rank 0 waited at all_reduce #64 while rank 1 was still in Inductor; 60 s was not enough).
+inline double timeout_s() {
+  const char* e = std::getenv("VLLM_XPU_EXCHANGE_TIMEOUT_S");
+  if (e && *e) { double v = std::atof(e); if (v > 0) return v; }
+  return 600.0;
+}
 constexpr int RING = 1024;
 
 namespace iex = sycl::ext::intel::experimental;
@@ -172,6 +180,23 @@ class Exchange {
 
   ~Exchange() { close(); }
 
+  // The hot path: false when this tensor is not for the exchange (dtype, size, layout) so the caller can fall back,
+  // without a second round of Python checks per layer; raises if an earlier exchange failed.
+  bool try_all_reduce_(const at::Tensor& t) {
+    if (!t.is_xpu() || !t.is_contiguous()) return false;
+    const size_t bytes = (size_t)t.numel() * t.element_size();
+    if (bytes > slot_bytes_ || bytes % 4 != 0) return false;
+    int dt;
+    switch (t.scalar_type()) {
+      case at::kFloat: dt = F32; break;
+      case at::kBFloat16: dt = BF16; break;
+      case at::kHalf: dt = F16; break;
+      default: return false;
+    }
+    run(t, bytes, dt);
+    return true;
+  }
+
   void all_reduce_(at::Tensor t) {
     TORCH_CHECK(t.is_xpu(), "xpu exchange: tensor must live on an XPU");
     TORCH_CHECK(t.is_contiguous(), "xpu exchange: tensor must be contiguous");
@@ -185,6 +210,11 @@ class Exchange {
       case at::kHalf: dt = F16; break;
       default: TORCH_CHECK(false, "xpu exchange: unsupported dtype ", t.scalar_type());
     }
+    run(t, bytes, dt);
+  }
+
+ private:
+  void run(const at::Tensor& t, size_t bytes, int dt) {
     check_status();
     if (bytes == 0) return;
     sycl::queue& q = c10::xpu::getCurrentXPUStream(t.device().index()).queue();
@@ -195,14 +225,25 @@ class Exchange {
     const size_t nwords = bytes / 4;
     if (bytes <= SMALL) ++n_small_; else ++n_big_;
     if (bytes <= SMALL) {
-      // K1: export my half as tagged words. 8-byte stores: a 32-byte vector store with the uncached hint ran ~80x
-      // slower (14.7 MB in 400 ms instead of 5 ms; 10:15), so the stores stay scalar; the hardware coalesces a lane
-      // group's consecutive 8-byte stores into full lines on its own.
+      // Small path, two launches: the export goes out *before* the guard so the helper can start the hop while the
+      // guard runs (one merged kernel launched after the guard measured 46.0 against 47.1 tok/s, 11:40). The export
+      // has no barrier: the helper validates every word's tag. The 8-byte stores stay scalar: a 32-byte vector store
+      // with the uncached hint ran ~80x slower (14.7 MB in 400 ms instead of 5 ms; 10:15).
       uint64_t* mine = mine_[b];
       q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
         uncached_wptr<uint64_t> m{mine};
         for (size_t i = it.get_local_id(0); i < nwords; i += WG) m[i] = tagged(x[i], tag);
       });
+      post(seq, bytes);
+      guard(seq);
+      const uint64_t* theirs = theirs_[b];
+      int64_t* status = status_;
+      switch (dt) {
+        case F32: add_kernel<F32>(q, x, theirs, status, seq, tag, nwords); break;
+        case BF16: add_kernel<BF16>(q, x, theirs, status, seq, tag, nwords); break;
+        default: add_kernel<F16>(q, x, theirs, status, seq, tag, nwords); break;
+      }
+      return;
     } else {
       // Big path (prefill chunks, MBs): the copy engine moves the bytes into pinned host memory at PCIe speed, then a
       // one-lane kernel, which the in-order queue starts only after the copy has completed, stores the sequence into
@@ -212,25 +253,9 @@ class Exchange {
       q.single_task([=]() { uncached_wptr<int64_t> m{marker}; m[0] = seq; });
     }
     post(seq, bytes);
-    // Before the card is told to wait for the peer's half of s, make sure the peer has at least published s-1 (a plain
-    // read of the shared flag). In lockstep this costs nothing; it keeps the Python thread at most one all_reduce ahead
-    // of the slower card, so the GPU wait only ever covers one layer of peer work plus the hop, never a JIT compile or
-    // a scheduler hiccup on the other side. A peer that is gone shows up here as a 60 s timeout.
-    if (seq > 1) {
-      volatile int64_t* peer_flag = reinterpret_cast<volatile int64_t*>(base_ + FLAG_OFF[peer_]);
-      if (!wait_word(peer_flag, seq - 1, stop_))
-        throw std::runtime_error("xpu exchange: the peer never reached all_reduce #" + std::to_string(seq - 1) + " within 60 s (peer gone or stalled)");
-    }
+    guard(seq);
     int64_t* status = status_;
-    if (bytes <= SMALL) {
-      // K2: wait for the peer's tagged words, add the data
-      const uint64_t* theirs = theirs_[b];
-      switch (dt) {
-        case F32: add_kernel<F32>(q, x, theirs, status, seq, tag, nwords); break;
-        case BF16: add_kernel<BF16>(q, x, theirs, status, seq, tag, nwords); break;
-        default: add_kernel<F16>(q, x, theirs, status, seq, tag, nwords); break;
-      }
-    } else {
+    {
       // K2a: one lane waits for the helper's marker (the peer's half is complete in theirs_plain[b] and flushed to
       // memory); then the copy engine brings it into card memory; then K2b adds from card memory (a fresh kernel,
       // plain loads: the coherence probe found copies into card memory visible to the next kernel in every case).
@@ -255,6 +280,7 @@ class Exchange {
     }
   }
 
+ public:
   // (gpu_timeout_seq, helper_timeout_seq, sequence): zero means no failure so far
   std::tuple<int64_t, int64_t, int64_t> status() const {
     return {reinterpret_cast<volatile int64_t*>(status_)[0], reinterpret_cast<volatile int64_t*>(status_)[8], seq_};
@@ -332,7 +358,20 @@ class Exchange {
   }
 
  private:
-  // small path: one work-group, four tagged words per 32-byte load, scalar tail
+  // Before the card is told to wait for the peer's half of s, make sure the peer has at least published s-1 (a plain
+  // read of the shared flag). In lockstep this costs nothing; it keeps the Python thread at most one all_reduce ahead
+  // of the slower card, so the GPU wait only ever covers one layer of peer work plus the hop, never a JIT compile or
+  // a scheduler hiccup on the other side. A peer that is gone shows up here as a 60 s timeout.
+  void guard(int64_t seq) {
+    if (seq <= 1) return;
+    volatile int64_t* peer_flag = reinterpret_cast<volatile int64_t*>(base_ + FLAG_OFF[peer_]);
+    if (!wait_word(peer_flag, seq - 1, stop_))
+      throw std::runtime_error("xpu exchange: the peer never reached all_reduce #" + std::to_string(seq - 1) + " within " +
+                               std::to_string((int)timeout_s()) + " s (peer gone or stalled; VLLM_XPU_EXCHANGE_TIMEOUT_S)");
+  }
+
+  // small path add kernel, one work-group: wait for the peer's tagged words (four per 32-byte load, scalar tail) and
+  // add them in place
   template <int DT>
   static void add_kernel(sycl::queue& q, uint32_t* x, const uint64_t* theirs, int64_t* status, int64_t seq, uint32_t tag,
                          size_t nwords) {
@@ -355,7 +394,7 @@ class Exchange {
   void check_status() const {
     volatile int64_t* s = reinterpret_cast<volatile int64_t*>(status_);
     if (s[0] != 0) throw std::runtime_error("xpu exchange: the card waited too long for the peer's half at all_reduce #" + std::to_string(s[0]) + " (peer gone or stalled); results after that point are invalid");
-    if (s[8] != 0) throw std::runtime_error("xpu exchange: the helper thread waited over 60 s at all_reduce #" + std::to_string(s[8]) + " (peer gone or stalled)");
+    if (s[8] != 0) throw std::runtime_error("xpu exchange: the helper thread gave up waiting at all_reduce #" + std::to_string(s[8]) + " (peer gone or stalled; VLLM_XPU_EXCHANGE_TIMEOUT_S)");
   }
 
   char* slot(int rank, int b) const { return base_ + HEADER + (size_t)(rank * 2 + b) * slot_bytes_; }
@@ -371,13 +410,14 @@ class Exchange {
   // cached copy of the line before every read: the card's writes into host memory do not invalidate CPU cache lines.
   static bool wait_word(volatile int64_t* w, int64_t want, const std::atomic<bool>& stop, bool card_written = false) {
     auto t0 = std::chrono::steady_clock::now();
+    const double limit = timeout_s();
     uint32_t n = 0;
     for (;;) {
       if (card_written) { _mm_clflush(const_cast<const int64_t*>(w)); _mm_mfence(); }
       if (*w >= want) return true;
       if (stop.load(std::memory_order_relaxed)) return false;
       _mm_pause();
-      if ((++n & 0xfff) == 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > HELPER_TIMEOUT_S) return false;
+      if ((++n & 0xfff) == 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > limit) return false;
     }
   }
 
@@ -386,6 +426,7 @@ class Exchange {
   // cached copy of the line is not invalidated by it). False on timeout.
   bool collect_export(uint32_t* dst, const uint64_t* src, size_t nwords, uint32_t tag) {
     auto t0 = std::chrono::steady_clock::now();
+    const double limit = timeout_s();
     invalidate_lines(src, nwords * sizeof(uint64_t));
     for (size_t i = 0; i < nwords; ++i) {
       uint64_t v = reinterpret_cast<const volatile uint64_t*>(src)[i];
@@ -397,7 +438,7 @@ class Exchange {
         v = reinterpret_cast<const volatile uint64_t*>(src)[i];
         if ((++n & 0xfff) == 0) {
           if (stop_.load(std::memory_order_relaxed)) return false;
-          if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > HELPER_TIMEOUT_S) return false;
+          if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > limit) return false;
         }
       }
       dst[i] = data_of(v);
@@ -494,6 +535,7 @@ PYBIND11_MODULE(_xpu_exchange, m) {
       .def(pybind11::init<int, int, const std::string&, size_t, int>(), pybind11::arg("rank"), pybind11::arg("world_size"),
            pybind11::arg("name"), pybind11::arg("slot_bytes"), pybind11::arg("device_index"))
       .def("all_reduce_", &Exchange::all_reduce_, pybind11::arg("tensor"), "in-place all_reduce on the current XPU stream; returns at once")
+      .def("try_all_reduce_", &Exchange::try_all_reduce_, pybind11::arg("tensor"), "as all_reduce_, but returns False (and does nothing) for a tensor the exchange cannot take")
       .def("status", &Exchange::status, "(gpu_timeout_seq, helper_timeout_seq, sequence); zeros mean healthy")
       .def("debug", &Exchange::debug, "one line with every flag and the last jobs, for the log when something fails")
       .def("stats", &Exchange::stats, pybind11::arg("n") = 16, "helper stage timings (us) for the last n jobs")
