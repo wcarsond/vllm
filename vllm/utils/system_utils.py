@@ -7,6 +7,8 @@ import contextlib
 import logging
 import multiprocessing
 import os
+import platform
+from shutil import which
 import signal
 import sys
 from collections.abc import Callable, Iterator
@@ -269,21 +271,63 @@ def find_loaded_library(lib_name: str) -> str | None:
     shared libraries loaded by the process. We can use this file to find the path of the
     loaded library.
     """  # noqa
-    # Match the mapped file's name, not the whole line: an unrelated library
-    # whose name merely contains lib_name (e.g. TileLang's libcudart_stub.so
-    # when looking for libcudart) or a directory component containing it must
-    # not win. Legitimate filenames are {lib_name}.so[.*] or a name-mangled
-    # {lib_name}-<hash>.so[.*], and /proc/self/maps is ordered by mapping
-    # address rather than load order, so a substring hit is a
-    # nondeterministic hijack.
-    with open("/proc/self/maps") as f:
-        for line in f:
-            start = line.find("/")
-            if start == -1:
-                continue
-            path = line[start:].strip()
-            filename = path.rsplit("/", maxsplit=1)[-1]
-            if filename.startswith((f"{lib_name}.", f"{lib_name}-")):
-                return path
-    # the library is not loaded in the current process
-    return None
+    path = None
+    if platform.system() != 'Windows':
+        found_line = None
+        with open("/proc/self/maps") as f:
+            for line in f:
+                if lib_name in line:
+                    found_line = line
+                    break
+        if found_line is None:
+            # the library is not loaded in the current process
+            return None
+        # if lib_name is libcudart, we need to match a line with:
+        # address /path/to/libcudart-hash.so.11.0
+        start = found_line.index("/")
+        path = found_line[start:].strip()
+        filename = path.split("/")[-1]
+        assert filename.rpartition(".so")[0].startswith(lib_name), (
+            f"Unexpected filename: {filename} for library {lib_name}"
+        )
+    elif "cudart" in lib_name:
+        import torch
+        cudart_path = os.getenv("VLLM_CUDART_SO_PATH", None)
+        if cudart_path is None:
+            cuda_path = None
+            if os.environ.get("CUDA_HOME", None):
+                cuda_path = os.environ.get("CUDA_HOME")
+            elif os.environ.get("CUDA_ROOT", None):
+                cuda_path = os.environ.get("CUDA_ROOT")
+            elif os.environ.get("CUDA_PATH"):
+                cuda_path = os.environ.get("CUDA_PATH", None)
+
+            cuda_major_version = torch.version.cuda.split(
+                '.')[0] if torch.version.cuda else "12"
+            if cuda_major_version < "12":
+                cuda_major_version += "0"
+            if cuda_path:
+                dll_bin_path = os.path.join(cuda_path, "bin")
+                if os.path.exists(os.path.join(cuda_path, "bin", "x64")):
+                    dll_bin_path = os.path.join(cuda_path, "bin", "x64")
+                cudart_path = os.path.abspath(
+                    os.path.join(dll_bin_path, f"cudart64_{cuda_major_version}.dll"))
+            else:
+                nvcc_path = which("nvcc")
+                if nvcc_path:
+                    cudart_path = os.path.abspath(
+                        os.path.join(nvcc_path, f"cudart64_{cuda_major_version}.dll"))
+            if cudart_path:
+                os.environ["VLLM_CUDART_SO_PATH"] = cudart_path
+                logger.info('VLLM_CUDART_SO_PATH resolved to %s', cudart_path)
+            else:
+                raise ValueError(
+                    'VLLM_CUDART_SO_PATH is not set. '
+                    'VLLM_CUDART_SO_PATH need to be set with the absolute path '
+                    'to cudart dll on Windows (for example, set '
+                    'VLLM_CUDART_SO_PATH=C:\\CUDA\\v12.4\\bin\\cudart64_12.dll)'
+                )
+    elif "cumem_allocator" in lib_name:
+        path = os.path.join(os.path.dirname(__file__), '..',
+                            'cumem_allocator.pyd')
+    return path

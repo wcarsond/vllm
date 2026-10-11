@@ -243,9 +243,14 @@ async def run_vllm_snapshot_child(control: ControlArgs, args: Any) -> None:
 def main(argv: list[str] | None = None) -> None:
     control, remaining = parse_control_args(sys.argv[1:] if argv is None else argv)
     args = parse_vllm_args(remaining)
-    import uvloop
+    import platform
 
-    uvloop.run(run_vllm_snapshot_child(control, args))
+    if platform.system() == "Windows":
+        import winloop as uvloop_impl
+    else:
+        import uvloop as uvloop_impl
+
+    uvloop_impl.run(run_vllm_snapshot_child(control, args))
 
 
 if __name__ == "__main__":

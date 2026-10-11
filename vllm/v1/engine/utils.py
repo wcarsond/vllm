@@ -4,6 +4,7 @@
 import contextlib
 import os
 import threading
+import platform
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -1143,7 +1144,7 @@ def get_engine_zmq_bind_addresses(
         client_local_only = False
 
     def _addr() -> str:
-        if client_local_only:
+        if client_local_only and platform.system() != "Windows":
             return get_open_zmq_ipc_path()
         return get_tcp_uri(host, 0)
 
@@ -1318,7 +1319,12 @@ def launch_core_engines(
 
     if local_engines_only and dp_rank > 0:
         assert not handshake_local_only
-        local_handshake_address = get_open_zmq_ipc_path()
+        if platform.system() == "Windows":
+            local_handshake_address = get_engine_client_zmq_addr(
+                handshake_local_only, host, get_open_port()
+            )
+        else:
+            local_handshake_address = get_open_zmq_ipc_path()
         client_handshake_address = local_handshake_address
     else:
         local_handshake_address = handshake_address
@@ -1379,8 +1385,12 @@ def wait_for_engine_startup(
         and not parallel_config.data_parallel_external_lb
     )
 
-    # 1. Engine processes
-    if isinstance(launch.engine_manager, CoreEngineProcManager):
+    # 1. Engine processes. On Windows a process sentinel is a HANDLE, not a
+    # file descriptor, and zmq's poller cannot register it.
+    if (
+        isinstance(launch.engine_manager, CoreEngineProcManager)
+        and platform.system() != "Windows"
+    ):
         for sentinel in launch.engine_manager.sentinels():
             poller.register(sentinel, zmq.POLLIN)
     # 2. DP Coordinator process, if present
@@ -1397,6 +1407,18 @@ def wait_for_engine_startup(
     while any(conn_pending) or any(start_pending):
         events = poller.poll(STARTUP_POLL_PERIOD_MS)
         if not events:
+            # Windows: the engine-core sentinels are not in the poller (see
+            # above), so a dead core would never wake us; check on each timeout.
+            if (
+                platform.system() == "Windows"
+                and isinstance(launch.engine_manager, CoreEngineProcManager)
+                and (finished := launch.engine_manager.finished_procs())
+            ):
+                raise RuntimeError(
+                    "Engine core initialization failed. "
+                    "See root cause above. "
+                    f"Failed core proc(s): {finished}"
+                )
             if any(conn_pending):
                 logger.debug(
                     "Waiting for %d local, %d remote core engine proc(s) to connect.",

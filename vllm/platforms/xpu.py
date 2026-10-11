@@ -3,14 +3,21 @@
 
 import contextlib
 import os
+import sys
 from typing import TYPE_CHECKING
 
 import torch
 
 # import custom ops, trigger op registration
 import vllm_xpu_kernels._C  # noqa
-import vllm_xpu_kernels._moe_C  # noqa
 import vllm_xpu_kernels._xpu_C  # noqa
+
+# _moe_C is only built when the kernels were configured with
+# MOE_KERNELS_ENABLED (off in the Windows build until its grouped GEMM file
+# can be compiled). Dense models do not touch it; MoE models fail at use
+# with a missing-op error instead of taking the whole platform down here.
+with contextlib.suppress(ImportError):
+    import vllm_xpu_kernels._moe_C  # noqa
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -210,6 +217,17 @@ class XPUPlatform(Platform):
         elif selected_backend == AttentionBackendEnum.FLASH_ATTN:
             logger.info_once("Using Flash Attention backend.")
             return AttentionBackendEnum.FLASH_ATTN.get_path()
+        elif sys.platform == "win32" and selected_backend is None:
+            # The cutlass flash-attention kernels (vllm_xpu_kernels._vllm_fa2_C) take
+            # the device down on their first launch under the Windows driver
+            # (2026-10-10, Arc Pro B60, driver 32.0.101.9033); Triton's kernels, built
+            # at run time by the driver's own compiler, work. Explicit FLASH_ATTN
+            # above still honours a request for the cutlass path.
+            logger.info_once(
+                "Windows: using Triton Attention backend by default "
+                "(cutlass Flash Attention faults on this platform)."
+            )
+            return AttentionBackendEnum.TRITON_ATTN.get_path()
         elif selected_backend:
             raise ValueError(
                 f"Invalid attention backend for {cls.device_name}, "

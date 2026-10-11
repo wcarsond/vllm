@@ -1,0 +1,3 @@
+# Windows-only requirements (read by setup.py when platform.system() == "Windows").
+# uvloop has no Windows build; winloop is the same API on Windows.
+winloop

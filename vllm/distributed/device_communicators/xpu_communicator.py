@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import sys
+from typing import Any
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -12,6 +15,12 @@ from vllm.logger import init_logger
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+# Windows: no oneCCL, so no xccl process-group backend; the process groups are
+# gloo and every card-to-card operation is relayed through host RAM. See
+# xpu_ram_relay.py. GroupCoordinator routes the pipeline hand-off through
+# send_tensor_dict/recv_tensor_dict when supports_tensor_dict is True.
+_RAM_RELAY = sys.platform == "win32"
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
@@ -26,6 +35,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
         super().__init__(
             cpu_group, device, device_group, unique_name, use_all2all=use_all2all
         )
+        self.supports_tensor_dict = _RAM_RELAY
+        if _RAM_RELAY:
+            from . import xpu_ram_relay
+
+            self._relay = xpu_ram_relay
+            logger.info_once(
+                "XPU on Windows: card-to-card collectives relayed through host RAM "
+                "over gloo (no oneCCL on this platform)."
+            )
         self.ca_comm: None = None
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
@@ -59,7 +77,51 @@ class XpuCommunicator(DeviceCommunicatorBase):
             output.add_(gathered[rank])
         return output.view(input_.shape)
 
+    # ---- Windows RAM relay -------------------------------------------------
+    # Each method below stages through host memory on the gloo cpu_group when
+    # _RAM_RELAY is set and otherwise falls through to the xccl path.
+
+    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
+        if not _RAM_RELAY:
+            return super().send(tensor, dst)
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        self._relay.send(tensor, self.ranks[dst], self.cpu_group)
+
+    def recv(
+        self, size: torch.Size, dtype: torch.dtype, src: int | None = None
+    ) -> torch.Tensor:
+        if not _RAM_RELAY:
+            return super().recv(size, dtype, src)
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        return self._relay.recv(size, dtype, self.ranks[src], self.cpu_group, self.device)
+
+    def send_tensor_dict(
+        self, tensor_dict: dict[str, torch.Tensor | Any], dst: int
+    ) -> None:
+        assert _RAM_RELAY, "tensor dict fast path is the Windows relay only"
+        self._relay.send_tensor_dict(tensor_dict, self.ranks[dst], self.cpu_group)
+
+    def recv_tensor_dict(self, src: int) -> dict[str, torch.Tensor | Any]:
+        assert _RAM_RELAY, "tensor dict fast path is the Windows relay only"
+        return self._relay.recv_tensor_dict(self.ranks[src], self.cpu_group, self.device)
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if not _RAM_RELAY:
+            return super().all_gather(input_, dim)
+        if dim < 0:
+            dim += input_.dim()
+        input_size = input_.size()
+        gathered = self._relay.all_gather(input_, self.world_size, self.cpu_group)
+        gathered = gathered.movedim(0, dim)
+        return gathered.reshape(
+            input_size[:dim] + (self.world_size * input_size[dim],) + input_size[dim + 1 :]
+        )
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if _RAM_RELAY:
+            return self._relay.all_reduce(input_, self.cpu_group)
         if envs.VLLM_BATCH_INVARIANT:
             # XCCL changes its reduction order with message size. Gather first
             # and accumulate in rank order, independent of the token batch.
@@ -82,6 +144,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
 
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
+        if _RAM_RELAY:
+            output = self._relay.reduce_scatter(
+                input_tensor, chunk_size, world_size, self.cpu_group
+            )
+            return output.movedim(0, dim).contiguous()
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
         output = torch.empty(
@@ -218,12 +285,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # For xpu path, gather doesn't work properly together with ray
         # cluster so we use all_gather instead for now.
         input_size = input_.size()
-        # Allocate output tensor.
-        output_tensor = torch.empty(
-            (self.world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-        # All-gather.
-        dist.all_gather_single(output_tensor, input_, group=self.device_group)
+        if _RAM_RELAY:
+            output_tensor = self._relay.all_gather(input_, self.world_size, self.cpu_group)
+        else:
+            # Allocate output tensor.
+            output_tensor = torch.empty(
+                (self.world_size,) + input_size, dtype=input_.dtype, device=input_.device
+            )
+            # All-gather.
+            dist.all_gather_single(output_tensor, input_, group=self.device_group)
         if self.rank_in_group == dst:
             # Reshape
             output_tensor = output_tensor.movedim(0, dim)
@@ -237,6 +307,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
         return output_tensor
 
     def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
+        if _RAM_RELAY:
+            self._relay.broadcast(input_, self.ranks[src], self.cpu_group)
+            return
         dist.broadcast(input_, src=src, group=self.device_group)
 
     def dispatch_router_logits(

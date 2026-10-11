@@ -16,7 +16,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from multiprocessing.connection import Connection
+from multiprocessing.connection import _ConnectionBase
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as LockType
 from threading import Thread
@@ -572,8 +572,10 @@ class UnreadyWorkerProcHandle:
 
     proc: BaseProcess
     rank: int
-    ready_pipe: Connection
-    death_writer: Connection | None = None
+    # _ConnectionBase: Connection on Unix, PipeConnection on Windows (dataclass
+    # annotations are evaluated at class creation, so the name must exist here).
+    ready_pipe: _ConnectionBase
+    death_writer: _ConnectionBase | None = None
 
 
 @dataclass
@@ -586,7 +588,7 @@ class WorkerProcHandle:
     # the peer worker process i writes to MQ
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
-    death_writer: Connection | None = None
+    death_writer: _ConnectionBase | None = None
 
     @classmethod
     def from_unready_handle(
@@ -798,7 +800,9 @@ class WorkerProc:
         while pipes:
             ready = multiprocessing.connection.wait(pipes.keys())
             for pipe in ready:
-                assert isinstance(pipe, Connection)
+                # Connection on Unix, PipeConnection on Windows; both derive
+                # from _ConnectionBase.
+                assert isinstance(pipe, _ConnectionBase)
                 try:
                     # Wait until the WorkerProc is ready.
                     unready_proc_handle = pipes.pop(pipe)

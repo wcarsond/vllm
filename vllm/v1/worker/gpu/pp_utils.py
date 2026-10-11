@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pipeline Parallelism utils for V2 Model Runner."""
 
+import sys
 from collections import deque
 from dataclasses import dataclass
 
@@ -14,6 +15,20 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+# XPU on Windows has no device collectives (no oneCCL); the PP groups run on gloo,
+# which only moves CPU tensors. Stage the small token/count broadcasts through
+# host memory there, the same way xpu_ram_relay.py does for the communicator.
+_STAGE_VIA_HOST = sys.platform == "win32" and current_platform.is_xpu()
+
+
+def _broadcast(tensor: torch.Tensor, src: int, group) -> None:
+    if _STAGE_VIA_HOST and tensor.device.type != "cpu":
+        host = tensor.detach().to("cpu")
+        torch.distributed.broadcast(host, src=src, group=group)
+        tensor.copy_(host)
+        return
+    torch.distributed.broadcast(tensor, src=src, group=group)
 
 
 @dataclass
@@ -182,7 +197,7 @@ class PPHandler:
             # Must record the idx_mapping tensor since it was allocated
             # on the main stream.
             input_batch.idx_mapping.record_stream(self.broadcast_stream)
-            torch.distributed.broadcast(
+            _broadcast(
                 send, src=self.last_rank, group=self.broadcast_group
             )
 
@@ -206,10 +221,10 @@ class PPHandler:
                 num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
             )
             combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
-            torch.distributed.broadcast(
+            _broadcast(
                 sampled_tokens, src=self.last_rank, group=self.broadcast_group
             )
-            torch.distributed.broadcast(
+            _broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
             draft_tokens = None
@@ -220,7 +235,7 @@ class PPHandler:
                     dtype=torch.int64,
                     device=self.device,
                 )
-                torch.distributed.broadcast(
+                _broadcast(
                     draft_tokens, src=self.last_rank, group=self.broadcast_group
                 )
             event = self.broadcast_stream.record_event()
@@ -267,13 +282,13 @@ class PPHandler:
                 sampled_token_ids,
                 (0, self.max_sample_len - sampled_token_ids.shape[-1]),
             )
-            torch.distributed.broadcast(
+            _broadcast(
                 send_tokens.contiguous(),
                 src=self.last_rank,
                 group=self.broadcast_group,
             )
             combined = torch.stack((num_sampled, num_rejected), dim=0)
-            torch.distributed.broadcast(
+            _broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
             for tensor in (sampled_token_ids, num_sampled, num_rejected):

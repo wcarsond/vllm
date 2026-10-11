@@ -173,6 +173,11 @@ def get_tcp_uri(ip: str, port: int) -> str:
 
 
 def get_open_zmq_ipc_path() -> str:
+    if sys.platform == "win32":
+        # No Unix-domain ZMQ transport on Windows: hand out a loopback TCP
+        # address with a free port instead. Every local-only ZMQ endpoint in
+        # vLLM comes through here, so this one branch covers them all.
+        return get_tcp_uri("127.0.0.1", get_open_port())
     base_rpc_path = envs.VLLM_RPC_BASE_PATH
     return f"ipc://{base_rpc_path}/{uuid4()}"
 

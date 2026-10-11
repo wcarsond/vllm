@@ -571,8 +571,11 @@ class GroupCoordinator:
             current_platform.is_tpu() or current_platform.use_custom_op_collectives()
         )
 
+        # CPU (shared-memory fast path) and XPU on Windows (host-RAM relay over
+        # gloo, see xpu_ram_relay.py) both move the pipeline hand-off through
+        # the communicator's own send_tensor_dict/recv_tensor_dict.
         self.use_cpu_custom_send_recv = (
-            current_platform.is_cpu()
+            (current_platform.is_cpu() or current_platform.is_xpu())
             and self.device_communicator
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
