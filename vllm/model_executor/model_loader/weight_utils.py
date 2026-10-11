@@ -21,6 +21,7 @@ import filelock
 import huggingface_hub.constants
 import numpy as np
 import regex as re
+import sys
 import torch
 from safetensors.torch import load, load_file, safe_open
 from tqdm.auto import tqdm
@@ -65,6 +66,36 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+# Windows XPU debug knob: stretch the load to build the concurrent-load fault on a small model.
+def _xpu_private_copy_wanted() -> bool:
+    """Windows tensor-parallel loads copy every checkpoint tensor to private memory first.
+
+    Two tensor-parallel workers reading the same checkpoint and copying to two different cards
+    kill one of themselves with an access violation in the driver (0xC0000005), at a different
+    shard every run; one worker, a pipeline split, or dummy weights never do. Memory pressure was
+    ruled out on both the cards (WDDM counters) and the host (14.5 GB free at the fault). What
+    tensor split alone does is feed the same physical page-cache pages to two adapters at once.
+    Cloning each tensor before it is handed on means the cards only ever DMA from memory private
+    to their own process; the file pages are still shared between the CPUs, which is fine.
+    Measured 2026-10-11 on Qwen2.5-72B-AWQ: 0 of 6 parallel loads succeeded without this, 3 of 3
+    with it, cold start 157 s against 198 s for the serialized fallback. One host memcpy per
+    tensor. VLLM_XPU_PRIVATE_COPY=0 disables it; the serialized load is VLLM_XPU_LOAD_LOCK=1.
+    """
+    if sys.platform != "win32" or os.environ.get("VLLM_XPU_PRIVATE_COPY") == "0":
+        return False
+    if os.environ.get("VLLM_XPU_PRIVATE_COPY") == "1":
+        return True
+    try:
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+        return get_tensor_model_parallel_world_size() > 1
+    except Exception:  # noqa: BLE001  - not initialised yet: copy, the safe side
+        return True
+
+
+_xpu_private_copy = _xpu_private_copy_wanted() if sys.platform == "win32" else False
+_xpu_load_sleep_s = (float(os.environ.get("VLLM_XPU_LOAD_SLEEP_MS", "0")) / 1000.0
+                     if sys.platform == "win32" else 0.0)
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
@@ -1210,7 +1241,30 @@ def safetensors_weights_iterator(
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)
+                    if _xpu_private_copy:
+                        # Carson's "two cursors", 2026-10-11 18:50: both tensor-parallel
+                        # workers may READ the same file pages (CPUs sharing a read lock is
+                        # fine, measured), but each card must only ever DMA from memory
+                        # private to its own process. One host memcpy per tensor, trivial
+                        # next to PCIe; it turns every downstream device copy's source into
+                        # private heap instead of shared page-cache pages. Switch:
+                        # VLLM_XPU_PRIVATE_COPY=1 (Windows only).
+                        param = param.clone()
                     yield name, param
+                    if _xpu_load_sleep_s:
+                        time.sleep(_xpu_load_sleep_s)
+            # Windows XPU, 2026-10-11: two tensor-parallel workers each streaming a large
+            # checkpoint through file mappings while holding ~20 GB on their cards fault
+            # the driver (0xC0000005), at a different shard every run. Switchable per-shard
+            # mitigations and a slow-load knob, tested on the 72B which reproduces it every
+            # time; see PORT-NOTES "spill-B" and "build the failure".
+            if sys.platform == "win32":
+                if os.environ.get("VLLM_XPU_TRIM_WS") == "1":
+                    import ctypes
+                    ctypes.windll.psapi.EmptyWorkingSet(
+                        ctypes.windll.kernel32.GetCurrentProcess())
+                if os.environ.get("VLLM_XPU_EMPTY_CACHE") == "1":
+                    torch.xpu.empty_cache()
 
 
 def multi_thread_safetensors_weights_iterator(

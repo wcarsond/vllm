@@ -41,6 +41,38 @@ class XPUWorker(Worker):
         assert device_config.device_type == "xpu"
         assert current_platform.is_xpu()
 
+    @staticmethod
+    def _apply_working_set_ceiling() -> None:
+        """VLLM_XPU_WS_LIMIT_GB=<n>: hard-cap this worker's resident pages at n GiB (Windows).
+
+        The concurrent-load fault (0xC0000005 in the driver, 2026-10-11) needs two
+        tensor-parallel workers each streaming a checkpoint through host memory beside a
+        nearly full card on a 32 GB box; the driver's counters show nothing spilled from
+        the cards, so the pressure is on the host. Releasing the file pages between shards
+        helped one load in three - not a fix, because within a shard the mapping is
+        resident again at once. This is the continuous form of the same idea (Carson:
+        "dial back ... to just barely not make paging files"): a working-set ceiling the
+        OS enforces every instant, so a worker never holds more than n GiB of resident
+        pages no matter how fast it reads. Off unless the variable is set.
+        """
+        import ctypes
+        import sys
+
+        gb = os.environ.get("VLLM_XPU_WS_LIMIT_GB")
+        if sys.platform != "win32" or not gb:
+            return
+        k32 = ctypes.windll.kernel32
+        QUOTA_LIMITS_HARDWS_MIN_DISABLE = 0x2
+        QUOTA_LIMITS_HARDWS_MAX_ENABLE = 0x4
+        max_bytes = ctypes.c_size_t(int(float(gb) * (1 << 30)))
+        min_bytes = ctypes.c_size_t(64 << 20)
+        ok = k32.SetProcessWorkingSetSizeEx(
+            k32.GetCurrentProcess(), min_bytes, max_bytes,
+            QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE)
+        logger.info(
+            "Windows XPU: hard working-set ceiling %s GiB -> %s",
+            gb, "set" if ok else f"FAILED ({ctypes.get_last_error()})")
+
     def load_model(self, *args, **kwargs) -> None:
         """Load weights one worker at a time on Windows.
 
@@ -62,7 +94,13 @@ class XPUWorker(Worker):
         """
         import sys
 
-        if sys.platform != "win32":
+        # VLLM_XPU_NO_LOAD_LOCK=1 turns the serialization off, to reproduce the fault on
+        # purpose while the mechanism is still open.
+        # Since 2026-10-11 19:10 the default is the parallel load with a private copy per tensor
+        # (weight_utils._xpu_private_copy_wanted). This serialized load is the fallback, opt-in
+        # with VLLM_XPU_LOAD_LOCK=1; VLLM_XPU_NO_LOAD_LOCK is kept for the old scripts.
+        if (sys.platform != "win32" or os.environ.get("VLLM_XPU_LOAD_LOCK") != "1"
+                or os.environ.get("VLLM_XPU_NO_LOAD_LOCK") == "1"):
             return super().load_model(*args, **kwargs)
 
         import ctypes
@@ -89,12 +127,48 @@ class XPUWorker(Worker):
                 "Windows XPU: loading weights under a cross-worker lock (concurrent "
                 "host-to-device copies fault this driver; see xpu_worker.load_model)"
             )
+            torch.xpu.reset_peak_memory_stats()
             return super().load_model(*args, **kwargs)
         finally:
+            # Does loading actually overflow the card? The standalone reproducer only
+            # faults once it retains past the card into system memory, but a worker here
+            # holds well under the card's capacity, so either a transient peak crosses
+            # the line or that recipe does not describe this case. Measure it rather than
+            # assume (2026-10-11 17:15, Carson's look-ahead-carry idea depends on it).
+            try:
+                peak = torch.xpu.max_memory_allocated() / 2**30
+                total = torch.xpu.get_device_properties(
+                    self.device).total_memory / 2**30
+                logger.info(
+                    "Windows XPU rank %s: peak device allocation during load %.2f GiB "
+                    "of %.2f GiB on the card (%.0f%%)",
+                    getattr(self, "rank", "?"), peak, total, 100.0 * peak / total,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             k32.ReleaseMutex(handle)
             k32.CloseHandle(handle)
 
     def init_device(self):
+        self._apply_working_set_ceiling()
+        # 15:52: say out loud what this worker actually inherited. Every reproduction of
+        # the concurrent-copy access violation outside vLLM needs ZE_AFFINITY_MASK set,
+        # and the claim "vLLM does not set it" was read off the source rather than
+        # measured. A value leaking in from a shell or an earlier script would make one
+        # bug out of what currently looks like two.
+        import os as _os
+        import sys as _sys
+
+        if _sys.platform == "win32":
+            logger.info(
+                "Windows XPU worker rank %s: ZE_AFFINITY_MASK=%r, "
+                "ONEAPI_DEVICE_SELECTOR=%r, visible devices=%s",
+                getattr(self, "rank", "?"),
+                _os.environ.get("ZE_AFFINITY_MASK"),
+                _os.environ.get("ONEAPI_DEVICE_SELECTOR"),
+                torch.xpu.device_count(),
+            )
+
         # Windows: give every worker its own Triton cache directory.
         #
         # Triton compiles a kernel into a shared cache (~/.triton/cache/<hash>/) and publishes each
