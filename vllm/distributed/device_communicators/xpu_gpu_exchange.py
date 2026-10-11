@@ -57,7 +57,7 @@ class GpuExchange:
         for dtype in _DTYPES:
             for numel in (256, 65536):  # one-work-group path (<= 64 KB) and the wide path
                 t = torch.full((numel,), 1.0 if rank == 0 else 2.0, dtype=dtype, device=dev)
-                self.ext.all_reduce_(t)
+                t = self.ext.all_reduce_(t)
                 torch.xpu.synchronize(index)
                 if not bool((t == 3.0).all()):
                     wrong = (t != 3.0).nonzero().flatten()
@@ -71,9 +71,10 @@ class GpuExchange:
         nbytes = t.numel() * t.element_size()
         return t.dtype in _DTYPES and nbytes <= self.slot_bytes and nbytes % 4 == 0
 
-    def try_all_reduce(self, t: torch.Tensor) -> bool:
-        """The hot path: one C++ call that checks dtype, size and layout itself and returns False (doing nothing) when
-        the tensor is not for the exchange. In place on success. Raises if an earlier exchange timed out (peer gone)."""
+    def try_all_reduce(self, t: torch.Tensor):
+        """The hot path: one C++ call that checks dtype, size and layout itself and returns None (doing nothing) when
+        the tensor is not for the exchange, else the reduced tensor (a new one: vLLM's all_reduce is a functional custom
+        op and torch.compile reuses the input right after). Raises if an earlier exchange timed out (peer gone)."""
         try:
             return self.ext.try_all_reduce_(t)
         except RuntimeError:
@@ -81,7 +82,7 @@ class GpuExchange:
             raise
 
     def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
-        """In place; returns ``t``. Raises if an earlier exchange timed out (peer gone)."""
+        """Returns the reduced tensor (new). Raises if an earlier exchange timed out (peer gone)."""
         t = t.contiguous()
         if _TRACE or _STATS:
             self._calls += 1
@@ -91,11 +92,10 @@ class GpuExchange:
                 logger.info("xpu exchange helper stage times (seq, bytes, wait_for_card, publish, wait_for_peer, write_out) us: %s",
                             [(s, b, round(a), round(c), round(d), round(e)) for s, b, a, c, d, e, _ in self.ext.stats(6)])
         try:
-            self.ext.all_reduce_(t)
+            return self.ext.all_reduce_(t)
         except RuntimeError:
             logger.error("xpu exchange state at failure: %s", self.ext.debug())
             raise
-        return t
 
     def status(self):
         return self.ext.status()

@@ -164,8 +164,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
                     if _STATS_OR_TRACE:
                         if self._exchange.accepts(input_):
                             return self._exchange.all_reduce(input_)
-                    elif self._exchange.try_all_reduce(input_):
-                        return input_
+                    else:
+                        out = self._exchange.try_all_reduce(input_)
+                        if out is not None:
+                            return out
                 else:
                     nbytes = input_.numel() * input_.element_size()
                     if nbytes <= self._exchange.slot_bytes:

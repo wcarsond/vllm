@@ -361,6 +361,22 @@ class XPUPlatform(Platform):
                 "XPU Graph is not supported in the current PyTorch version, "
                 "disabling cudagraph_mode."
             )
+        elif (
+            sys.platform == "win32"
+            and vllm_config.parallel_config.world_size > 1
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            # Windows, two cards: the collectives run through host memory (xpu_gpu_exchange.py / xpu_ram_relay.py), with a
+            # helper thread and host-side waits that a graph capture can neither record nor replay. Capturing recorded the
+            # exchange's kernels without running them and left both cards faulted at the first all_reduce (2026-10-11,
+            # PORT-NOTES "Triton dig"). torch.compile itself (fused kernels, fewer launches) stays on; only the graph
+            # replay goes.
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            logger.warning_once(
+                "Windows XPU with %d cards: disabling cudagraph_mode (the host-memory "
+                "collectives cannot be captured); torch.compile stays on.",
+                vllm_config.parallel_config.world_size,
+            )
 
         if (
             vllm_config.model_config is not None

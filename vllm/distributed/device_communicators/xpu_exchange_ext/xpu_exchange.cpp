@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -180,24 +181,27 @@ class Exchange {
 
   ~Exchange() { close(); }
 
-  // The hot path: false when this tensor is not for the exchange (dtype, size, layout) so the caller can fall back,
+  // The hot path: no tensor when this one is not for the exchange (dtype, size, layout) so the caller can fall back,
   // without a second round of Python checks per layer; raises if an earlier exchange failed.
-  bool try_all_reduce_(const at::Tensor& t) {
-    if (!t.is_xpu() || !t.is_contiguous()) return false;
+  // Out of place on purpose: vLLM registers all_reduce as a functional custom op (the fake returns empty_like), so under
+  // torch.compile Inductor reuses the input's buffer right after the call; an in-place result was overwritten by the next
+  // kernel and the compiled two-card run produced garbage (2026-10-11 12:00). The add kernel writes a fresh tensor, no
+  // extra launch.
+  std::optional<at::Tensor> try_all_reduce_(const at::Tensor& t) {
+    if (!t.is_xpu() || !t.is_contiguous()) return std::nullopt;
     const size_t bytes = (size_t)t.numel() * t.element_size();
-    if (bytes > slot_bytes_ || bytes % 4 != 0) return false;
+    if (bytes > slot_bytes_ || bytes % 4 != 0) return std::nullopt;
     int dt;
     switch (t.scalar_type()) {
       case at::kFloat: dt = F32; break;
       case at::kBFloat16: dt = BF16; break;
       case at::kHalf: dt = F16; break;
-      default: return false;
+      default: return std::nullopt;
     }
-    run(t, bytes, dt);
-    return true;
+    return run(t, bytes, dt);
   }
 
-  void all_reduce_(at::Tensor t) {
+  at::Tensor all_reduce_(const at::Tensor& t) {
     TORCH_CHECK(t.is_xpu(), "xpu exchange: tensor must live on an XPU");
     TORCH_CHECK(t.is_contiguous(), "xpu exchange: tensor must be contiguous");
     const size_t bytes = (size_t)t.numel() * t.element_size();
@@ -210,18 +214,20 @@ class Exchange {
       case at::kHalf: dt = F16; break;
       default: TORCH_CHECK(false, "xpu exchange: unsupported dtype ", t.scalar_type());
     }
-    run(t, bytes, dt);
+    return run(t, bytes, dt);
   }
 
  private:
-  void run(const at::Tensor& t, size_t bytes, int dt) {
+  at::Tensor run(const at::Tensor& t, size_t bytes, int dt) {
     check_status();
-    if (bytes == 0) return;
+    at::Tensor out = at::empty_like(t);
+    if (bytes == 0) return out;
     sycl::queue& q = c10::xpu::getCurrentXPUStream(t.device().index()).queue();
     const int64_t seq = ++seq_;
     const uint32_t tag = (uint32_t)seq;
     const int b = (int)(seq & 1);
     uint32_t* x = static_cast<uint32_t*>(t.data_ptr());
+    uint32_t* y = static_cast<uint32_t*>(out.data_ptr());
     const size_t nwords = bytes / 4;
     if (bytes <= SMALL) ++n_small_; else ++n_big_;
     if (bytes <= SMALL) {
@@ -239,11 +245,11 @@ class Exchange {
       const uint64_t* theirs = theirs_[b];
       int64_t* status = status_;
       switch (dt) {
-        case F32: add_kernel<F32>(q, x, theirs, status, seq, tag, nwords); break;
-        case BF16: add_kernel<BF16>(q, x, theirs, status, seq, tag, nwords); break;
-        default: add_kernel<F16>(q, x, theirs, status, seq, tag, nwords); break;
+        case F32: add_kernel<F32>(q, x, y, theirs, status, seq, tag, nwords); break;
+        case BF16: add_kernel<BF16>(q, x, y, theirs, status, seq, tag, nwords); break;
+        default: add_kernel<F16>(q, x, y, theirs, status, seq, tag, nwords); break;
       }
-      return;
+      return out;
     } else {
       // Big path (prefill chunks, MBs): the copy engine moves the bytes into pinned host memory at PCIe speed, then a
       // one-lane kernel, which the in-order queue starts only after the copy has completed, stores the sequence into
@@ -273,11 +279,12 @@ class Exchange {
       q.memcpy(theirs_dev_[b], theirs_plain_[b], bytes);
       const uint32_t* theirs = reinterpret_cast<const uint32_t*>(theirs_dev_[b]);
       switch (dt) {
-        case F32: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { x[i] = add_words<F32>(x[i], theirs[i]); }); break;
-        case BF16: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { x[i] = add_words<BF16>(x[i], theirs[i]); }); break;
-        default: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { x[i] = add_words<F16>(x[i], theirs[i]); }); break;
+        case F32: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<F32>(x[i], theirs[i]); }); break;
+        case BF16: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<BF16>(x[i], theirs[i]); }); break;
+        default: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<F16>(x[i], theirs[i]); }); break;
       }
     }
+    return out;
   }
 
  public:
@@ -373,21 +380,21 @@ class Exchange {
   // small path add kernel, one work-group: wait for the peer's tagged words (four per 32-byte load, scalar tail) and
   // add them in place
   template <int DT>
-  static void add_kernel(sycl::queue& q, uint32_t* x, const uint64_t* theirs, int64_t* status, int64_t seq, uint32_t tag,
-                         size_t nwords) {
+  static void add_kernel(sycl::queue& q, const uint32_t* x, uint32_t* y, const uint64_t* theirs, int64_t* status,
+                         int64_t seq, uint32_t tag, size_t nwords) {
     const size_t nvec = nwords / 4;
     q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
       size_t lid = it.get_local_id(0);
       for (size_t v = lid; v < nvec; v += WG) {
         u64x4 w = wait_tagged4(theirs + 4 * v, tag, seq, status);
         size_t i = 4 * v;
-        x[i] = add_words<DT>(x[i], data_of(w[0]));
-        x[i + 1] = add_words<DT>(x[i + 1], data_of(w[1]));
-        x[i + 2] = add_words<DT>(x[i + 2], data_of(w[2]));
-        x[i + 3] = add_words<DT>(x[i + 3], data_of(w[3]));
+        y[i] = add_words<DT>(x[i], data_of(w[0]));
+        y[i + 1] = add_words<DT>(x[i + 1], data_of(w[1]));
+        y[i + 2] = add_words<DT>(x[i + 2], data_of(w[2]));
+        y[i + 3] = add_words<DT>(x[i + 3], data_of(w[3]));
       }
       for (size_t i = 4 * nvec + lid; i < nwords; i += WG)
-        x[i] = add_words<DT>(x[i], data_of(wait_tagged(theirs + i, tag, seq, status)));
+        y[i] = add_words<DT>(x[i], data_of(wait_tagged(theirs + i, tag, seq, status)));
     });
   }
 
@@ -534,8 +541,8 @@ PYBIND11_MODULE(_xpu_exchange, m) {
   pybind11::class_<Exchange>(m, "Exchange")
       .def(pybind11::init<int, int, const std::string&, size_t, int>(), pybind11::arg("rank"), pybind11::arg("world_size"),
            pybind11::arg("name"), pybind11::arg("slot_bytes"), pybind11::arg("device_index"))
-      .def("all_reduce_", &Exchange::all_reduce_, pybind11::arg("tensor"), "in-place all_reduce on the current XPU stream; returns at once")
-      .def("try_all_reduce_", &Exchange::try_all_reduce_, pybind11::arg("tensor"), "as all_reduce_, but returns False (and does nothing) for a tensor the exchange cannot take")
+      .def("all_reduce_", &Exchange::all_reduce_, pybind11::arg("tensor"), "all_reduce on the current XPU stream into a new tensor; returns at once")
+      .def("try_all_reduce_", &Exchange::try_all_reduce_, pybind11::arg("tensor"), "as all_reduce_, but returns None (and does nothing) for a tensor the exchange cannot take")
       .def("status", &Exchange::status, "(gpu_timeout_seq, helper_timeout_seq, sequence); zeros mean healthy")
       .def("debug", &Exchange::debug, "one line with every flag and the last jobs, for the log when something fails")
       .def("stats", &Exchange::stats, pybind11::arg("n") = 16, "helper stage timings (us) for the last n jobs")

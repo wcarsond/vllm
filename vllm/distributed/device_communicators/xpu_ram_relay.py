@@ -53,8 +53,49 @@ def _timed(name):
     return deco
 
 
+_RELAY_DEBUG = os.environ.get("VLLM_XPU_RELAY_DEBUG") == "1"
+_STAGE: dict = {}
+
+
 def _to_host(t: torch.Tensor) -> torch.Tensor:
     # .contiguous() first: gloo wants dense buffers; .cpu() then copies once.
+    if _RELAY_DEBUG:
+        # 2026-10-11: under torch.compile on two cards this copy fails with UR_RESULT_ERROR_UNKNOWN on a tensor the
+        # compiled graph just produced. Say what the tensor is and whether the card itself can still copy it.
+        meta = f"{tuple(t.shape)} {t.dtype} {t.device} ptr {t.data_ptr():#x} contiguous {t.is_contiguous()}"
+        try:
+            torch.xpu.synchronize(t.device)
+            sync = "sync ok"
+        except Exception as e:  # noqa: BLE001
+            sync = f"sync FAILED: {e}"
+        # the first failing copy kills the card for the rest of the call, so the most useful test goes first:
+        # a kernel copy into a buffer this module allocated long before (not by the compiled graph), then that
+        # buffer's copy to host; then a copy into pinned memory; the plain .cpu() comes last
+        clone = ""
+        key = (tuple(t.shape), t.dtype, str(t.device))
+        try:
+            stage = _STAGE.get(key)
+            if stage is None:
+                stage = _STAGE[key] = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+            stage.copy_(t)
+            torch.xpu.synchronize(t.device)
+            clone += f"stage ptr {stage.data_ptr():#x} copy_ ok"
+            stage.cpu()
+            clone += ", stage->cpu ok"
+        except Exception as e:  # noqa: BLE001
+            clone += f", stage path FAILED ({str(e)[:40]})"
+        try:
+            pin = torch.empty(t.shape, dtype=t.dtype, pin_memory=True); pin.copy_(t); torch.xpu.synchronize(t.device)
+            clone += ", ->pinned ok"
+        except Exception as e:  # noqa: BLE001
+            clone += f", ->pinned FAILED ({str(e)[:40]})"
+        try:
+            host = t.detach().contiguous().cpu()
+            print(f"[relay debug pid {os.getpid()}] {meta}; {sync}; {clone}; cpu ok", file=sys.stderr, flush=True)
+            return host
+        except Exception as e:  # noqa: BLE001
+            print(f"[relay debug pid {os.getpid()}] {meta}; {sync}; {clone}; cpu FAILED: {e}", file=sys.stderr, flush=True)
+            raise
     return t.detach().contiguous().cpu()
 
 
