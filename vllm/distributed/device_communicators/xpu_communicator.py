@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import sys
 from typing import Any
 
@@ -40,9 +41,20 @@ class XpuCommunicator(DeviceCommunicatorBase):
             from . import xpu_ram_relay
 
             self._relay = xpu_ram_relay
+            # Two-rank all_reduce goes through shared host memory instead of gloo
+            # (xpu_shm_exchange.py): 33 us against 233 us for a 7 KB decode
+            # tensor, measured 2026-10-10. VLLM_XPU_EXCHANGE=gloo opts out.
+            # Built on first use so the collective that names the block runs in
+            # lockstep on both ranks.
+            self._exchange = None
+            self._exchange_wanted = (
+                self.world_size == 2
+                and os.environ.get("VLLM_XPU_EXCHANGE", "shm").lower() == "shm"
+            )
             logger.info_once(
                 "XPU on Windows: card-to-card collectives relayed through host RAM "
-                "over gloo (no oneCCL on this platform)."
+                "over gloo (no oneCCL on this platform)%s.",
+                "; two-rank all_reduce through shared memory" if self._exchange_wanted else "",
             )
         self.ca_comm: None = None
         if self.use_all2all:
@@ -121,6 +133,17 @@ class XpuCommunicator(DeviceCommunicatorBase):
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if _RAM_RELAY:
+            if self._exchange_wanted:
+                if self._exchange is None:
+                    from .xpu_shm_exchange import ShmExchange
+
+                    self._exchange = ShmExchange(
+                        self.rank_in_group, self.world_size, self.cpu_group, self.device
+                    )
+                nbytes = input_.numel() * input_.element_size()
+                if nbytes <= self._exchange.slot_bytes:
+                    return self._exchange.all_reduce(input_.clone())
+                # larger than a slot (a very long prefill chunk): the gloo relay still works
             return self._relay.all_reduce(input_, self.cpu_group)
         if envs.VLLM_BATCH_INVARIANT:
             # XCCL changes its reduction order with message size. Gather first
