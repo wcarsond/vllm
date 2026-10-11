@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+import sys
 
 import torch
 
@@ -41,6 +42,35 @@ class XPUWorker(Worker):
         assert current_platform.is_xpu()
 
     def init_device(self):
+        # Windows: give every worker its own Triton cache directory.
+        #
+        # Triton compiles a kernel into a shared cache (~/.triton/cache/<hash>/) and publishes each
+        # artifact by writing a temporary file and renaming it into place. On POSIX that rename is
+        # atomic and two processes compiling the same kernel simply race harmlessly. On Windows a
+        # rename onto an existing, open file raises PermissionError, so two workers compiling the
+        # SAME kernel at the SAME moment kill one of each other. With eager execution the model's
+        # own Triton kernels (not Inductor's - compiler_interface.py already per-ranks those) go
+        # straight to the default directory, so tensor parallel hits this whenever both ranks reach
+        # a new kernel together, which is exactly what two symmetric ranks do.
+        #
+        # Seen 2026-10-11 14:30 on Qwen3.5-27B, whose Gated DeltaNet layers compile Triton kernels
+        # at load: "PermissionError: [Errno 13] Permission denied: ...\\_fused_post_conv_kernel.json"
+        # from rank 1 while rank 0 wrote the same file. Per-rank directories cost one recompile per
+        # rank on a cold cache and remove the race entirely.
+        if sys.platform == "win32":
+            base = os.environ.get("TRITON_CACHE_DIR") or os.path.join(
+                os.path.expanduser("~"), ".triton", "cache"
+            )
+            if not base.endswith(f"rank{self.rank}"):
+                per_rank = os.path.join(base, f"rank{self.rank}")
+                os.makedirs(per_rank, exist_ok=True)
+                os.environ["TRITON_CACHE_DIR"] = per_rank
+                logger.info_once(
+                    "Windows XPU: per-rank Triton cache at %s (a shared cache races on "
+                    "Windows renames; see xpu_worker.init_device)",
+                    per_rank,
+                )
+
         # In DP mode, XPU workers see all visible devices.
         # Offset local_rank by the local DP shard.
         parallel_config = self.parallel_config
