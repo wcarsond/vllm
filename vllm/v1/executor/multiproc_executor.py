@@ -794,6 +794,11 @@ class WorkerProc:
         )
 
         pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
+        # Per-pipe count of EOFs seen while the owning process was still alive (Windows;
+        # see the EOFError handler below). Budget is generous because the retry only
+        # happens while the worker is provably running.
+        spurious: dict[_ConnectionBase, int] = {}
+        _MAX_SPURIOUS_EOF = 2000
         ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
             unready_proc_handles
         )
@@ -815,12 +820,68 @@ class WorkerProc:
                         response, unready_proc_handle
                     )
                 except EOFError:
+                    # EOF on the ready pipe normally means the worker died before it could
+                    # say READY. Check that it actually did, because on Windows it can lie.
+                    #
+                    # 2026-10-11, loading a 72B AWQ checkpoint with tensor_parallel_size=2:
+                    # ten seconds into loading (shard 4 of 11) this pipe reported EOF while
+                    # the worker was alive and still loading. The executor then tore down
+                    # two healthy workers, which looked exactly like a silent crash: no
+                    # traceback, no exit code, nothing in the Windows event log. It only
+                    # reproduces with a long load and more than one worker, so smaller
+                    # models hid it.
+                    #
+                    # If the process is alive, treat the EOF as spurious, put the pipe back
+                    # and keep waiting. A worker that really is gone has an exit code, and
+                    # a genuinely dead pipe re-EOFs immediately, so the retry budget below
+                    # keeps that from spinning.
+                    code = unready_proc_handle.proc.exitcode
+                    if code is None:
+                        spurious[pipe] = spurious.get(pipe, 0) + 1
+                        if spurious[pipe] <= _MAX_SPURIOUS_EOF:
+                            logger.warning(
+                                "WorkerProc rank %d: ready pipe reported EOF but the "
+                                "process is alive; still loading. Ignoring (%d/%d).",
+                                unready_proc_handle.rank,
+                                spurious[pipe],
+                                _MAX_SPURIOUS_EOF,
+                            )
+                            pipes[pipe] = unready_proc_handle
+                            time.sleep(0.5)
+                            continue
+                        logger.error(
+                            "WorkerProc rank %d: ready pipe gave EOF %d times while the "
+                            "process stayed alive; giving up on it.",
+                            unready_proc_handle.rank,
+                            spurious[pipe],
+                        )
+                    else:
+                        # A real death. Windows encodes the cause in the exit code:
+                        # 0xC0000005 access violation, 0xC0000006 in-page error,
+                        # 0xC0000409 fast-fail, 0xC0000017 out of memory.
+                        detail = f"exit code {code}"
+                        if code < 0:
+                            detail += f" (signal {-code})"
+                        else:
+                            detail += f" (0x{code & 0xFFFFFFFF:08X})"
+                        logger.error(
+                            "WorkerProc rank %d died before signalling READY: %s. No "
+                            "traceback above means it was killed rather than raising.",
+                            unready_proc_handle.rank,
+                            detail,
+                        )
                     e.__suppress_context__ = True
                     raise e from None
 
                 finally:
-                    # Close connection.
-                    pipe.close()
+                    # Close the connection unless we deliberately put it back to keep
+                    # waiting on it (the spurious-EOF path above). `finally` runs on
+                    # `continue` too, so closing unconditionally here would shut the pipe
+                    # we just re-queued and the next wait() would raise
+                    # "OSError: handle is closed" (2026-10-11, caught on the first run
+                    # of the retry).
+                    if pipe not in pipes:
+                        pipe.close()
 
         return cast(list[WorkerProcHandle], ready_proc_handles)
 

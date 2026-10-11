@@ -41,6 +41,59 @@ class XPUWorker(Worker):
         assert device_config.device_type == "xpu"
         assert current_platform.is_xpu()
 
+    def load_model(self, *args, **kwargs) -> None:
+        """Load weights one worker at a time on Windows.
+
+        Two processes copying large amounts of host memory to their own cards at the same
+        time kill one of themselves with an access violation (0xC0000005) on this driver.
+        Reproduced with no vLLM in it at all (probe/mmap-readers.input.py, 2026-10-11):
+        two processes, one card each, reading a 41.6 GB checkpoint and copying every
+        tensor across. One process doing the identical work is fine; two processes reading
+        the same files WITHOUT the device copies are fine; copying from ordinary heap
+        memory instead of a file mapping fails just the same. So it is the concurrency of
+        the host-to-device traffic, not the mapping, the files, or the volume.
+
+        It needs a model big enough for the two loads to overlap for long enough, which is
+        why Qwen2.5-72B-AWQ (39 GB) hits it every time and smaller models never did.
+
+        Serializing the load costs wall-clock time on a cold start and nothing else. A
+        named mutex is used rather than the executor's `shared_worker_lock` because that
+        lock is consumed by the multimodal cache before the worker object exists.
+        """
+        import sys
+
+        if sys.platform != "win32":
+            return super().load_model(*args, **kwargs)
+
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        handle = k32.CreateMutexW(None, False, "Local\\vllm-xpu-weight-load")
+        if not handle:
+            logger.warning(
+                "Windows XPU: could not create the weight-loading mutex (%s); loading "
+                "concurrently, which can crash a worker with 0xC0000005",
+                ctypes.get_last_error(),
+            )
+            return super().load_model(*args, **kwargs)
+        # 0xFFFFFFFF = INFINITE. 0x80 = WAIT_ABANDONED, i.e. a previous holder died while
+        # holding it; we still own it now, so carry on.
+        waited = k32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        if waited == 0x80:
+            logger.warning(
+                "Windows XPU: the previous holder of the weight-loading mutex died; "
+                "continuing."
+            )
+        try:
+            logger.info_once(
+                "Windows XPU: loading weights under a cross-worker lock (concurrent "
+                "host-to-device copies fault this driver; see xpu_worker.load_model)"
+            )
+            return super().load_model(*args, **kwargs)
+        finally:
+            k32.ReleaseMutex(handle)
+            k32.CloseHandle(handle)
+
     def init_device(self):
         # Windows: give every worker its own Triton cache directory.
         #
