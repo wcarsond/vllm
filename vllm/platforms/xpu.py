@@ -217,15 +217,21 @@ class XPUPlatform(Platform):
         elif selected_backend == AttentionBackendEnum.FLASH_ATTN:
             logger.info_once("Using Flash Attention backend.")
             return AttentionBackendEnum.FLASH_ATTN.get_path()
-        elif sys.platform == "win32" and selected_backend is None:
-            # The cutlass flash-attention kernels (vllm_xpu_kernels._vllm_fa2_C) take
-            # the device down on their first launch under the Windows driver
-            # (2026-10-10, Arc Pro B60, driver 32.0.101.9033); Triton's kernels, built
-            # at run time by the driver's own compiler, work. Explicit FLASH_ATTN
-            # above still honours a request for the cutlass path.
+        elif (
+            sys.platform == "win32"
+            and selected_backend is None
+            and os.environ.get("VLLM_XPU_WINDOWS_TRITON_DEFAULT") == "1"
+        ):
+            # History: on 2026-10-10 the cutlass flash-attention kernels took the
+            # device down on every launch under Windows. The cause was a 32-bit
+            # `long` holding 64-bit addresses in cutlass-sycl's block-2D copy atoms
+            # (fixed in the kernel build; see scripts/vllm-xpu-windows/PORT-NOTES.md).
+            # With the fix, cutlass is 1.7-4.5x faster than Triton at 4K-32K of
+            # context, so the default is upstream's again. This switch keeps the
+            # Triton default one environment variable away for an unfixed build.
             logger.info_once(
                 "Windows: using Triton Attention backend by default "
-                "(cutlass Flash Attention faults on this platform)."
+                "(VLLM_XPU_WINDOWS_TRITON_DEFAULT=1)."
             )
             return AttentionBackendEnum.TRITON_ATTN.get_path()
         elif selected_backend:

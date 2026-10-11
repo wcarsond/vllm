@@ -861,6 +861,51 @@ class WorkerProc:
         ).start()
 
     @staticmethod
+    def _hard_exit_if_windows_xpu() -> None:
+        """End a Windows XPU worker without running DLL unload handlers.
+
+        A normal exit (ExitProcess) runs every loaded DLL's detach code after
+        the interpreter is gone. The attention kernel library
+        (attn_kernels_xe_2.dll) destroys a static SYCL device there; the Intel
+        OpenCL runtime that device was created on spins forever releasing its
+        context (a SwitchToThread loop in igdrcl64.dll), and Windows leaves the
+        process marked exited with one thread at 100% CPU that no kill reaches
+        until a reboot (2026-10-11, every finished tensor-split run; stacks in
+        probe/thread-stack.cpp). By this point the worker has torn down its
+        state and the kernel driver reclaims card memory on termination, so
+        end the process the way the executor ends a worker it kills:
+        TerminateProcess. Single-process engines never see the hang because
+        the parent terminates the EngineCore the same way.
+        """
+        import sys
+
+        if sys.platform != "win32":
+            return
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_xpu():
+            return
+        import ctypes
+        import logging
+
+        logger.info(
+            "Windows XPU worker: shutdown complete, ending the process with "
+            "TerminateProcess (DLL unload handlers hang in the OpenCL runtime)"
+        )
+        for name in ("vllm", ""):
+            for handler in logging.getLogger(name).handlers:
+                try:
+                    handler.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        ctypes.windll.kernel32.TerminateProcess(ctypes.c_void_p(-1), 0)
+
+    @staticmethod
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
@@ -987,6 +1032,7 @@ class WorkerProc:
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
+            WorkerProc._hard_exit_if_windows_xpu()
 
     class ResponseStatus(Enum):
         SUCCESS = auto()

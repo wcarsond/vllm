@@ -47,14 +47,14 @@ class XpuCommunicator(DeviceCommunicatorBase):
             # Built on first use so the collective that names the block runs in
             # lockstep on both ranks.
             self._exchange = None
-            self._exchange_wanted = (
-                self.world_size == 2
-                and os.environ.get("VLLM_XPU_EXCHANGE", "shm").lower() == "shm"
-            )
+            # VLLM_XPU_EXCHANGE: gpu (default; GPU-timeline exchange, xpu_gpu_exchange.py),
+            # shm (host-synchronous shared-memory exchange, xpu_shm_exchange.py), gloo (relay only)
+            self._exchange_kind = os.environ.get("VLLM_XPU_EXCHANGE", "gpu").lower()
+            self._exchange_wanted = self.world_size == 2 and self._exchange_kind in ("gpu", "shm")
             logger.info_once(
                 "XPU on Windows: card-to-card collectives relayed through host RAM "
                 "over gloo (no oneCCL on this platform)%s.",
-                "; two-rank all_reduce through shared memory" if self._exchange_wanted else "",
+                f"; two-rank all_reduce through the {self._exchange_kind} exchange" if self._exchange_wanted else "",
             )
         self.ca_comm: None = None
         if self.use_all2all:
@@ -88,6 +88,13 @@ class XpuCommunicator(DeviceCommunicatorBase):
         for rank in range(1, self.world_size):
             output.add_(gathered[rank])
         return output.view(input_.shape)
+
+    def destroy(self):
+        exchange = getattr(self, "_exchange", None)
+        if exchange is not None and hasattr(exchange, "close"):
+            exchange.close()
+            self._exchange = None
+        super().destroy()
 
     # ---- Windows RAM relay -------------------------------------------------
     # Each method below stages through host memory on the gloo cpu_group when
@@ -135,15 +142,28 @@ class XpuCommunicator(DeviceCommunicatorBase):
         if _RAM_RELAY:
             if self._exchange_wanted:
                 if self._exchange is None:
-                    from .xpu_shm_exchange import ShmExchange
+                    if self._exchange_kind == "gpu":
+                        from .xpu_gpu_exchange import GpuExchange
 
-                    self._exchange = ShmExchange(
-                        self.rank_in_group, self.world_size, self.cpu_group, self.device
-                    )
-                nbytes = input_.numel() * input_.element_size()
-                if nbytes <= self._exchange.slot_bytes:
-                    return self._exchange.all_reduce(input_.clone())
-                # larger than a slot (a very long prefill chunk): the gloo relay still works
+                        self._exchange = GpuExchange(
+                            self.rank_in_group, self.world_size, self.cpu_group, self.device
+                        )
+                    else:
+                        from .xpu_shm_exchange import ShmExchange
+
+                        self._exchange = ShmExchange(
+                            self.rank_in_group, self.world_size, self.cpu_group, self.device
+                        )
+                if self._exchange_kind == "gpu":
+                    if self._exchange.accepts(input_):
+                        # in place: GroupCoordinator.all_reduce documents that the input may be modified and the
+                        # return value is the output; the clone was one more Python op and kernel per layer
+                        return self._exchange.all_reduce(input_)
+                else:
+                    nbytes = input_.numel() * input_.element_size()
+                    if nbytes <= self._exchange.slot_bytes:
+                        return self._exchange.all_reduce(input_.clone())
+                # larger than a slot (a very long prefill chunk) or an odd dtype: the gloo relay still works
             return self._relay.all_reduce(input_, self.cpu_group)
         if envs.VLLM_BATCH_INVARIANT:
             # XCCL changes its reduction order with message size. Gather first
