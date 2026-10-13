@@ -1312,6 +1312,20 @@ class Platform:
     def get_global_graph_pool(self) -> Any:
         """Return the global graph pool for this platform."""
         cls = self.__class__
+        # One process, two cards (Windows XPU): one pool per rank. torch's pinned-host allocator is process-wide and
+        # keeps graph pools by id, so a pool shared by both ranks' captures was released by one and re-entered by the
+        # other at use count 0 (INTERNAL ASSERT use_count > 0, 2026-10-13 17:46).
+        from vllm.distributed.device_communicators import xpu_oneproc
+
+        r = xpu_oneproc.current_rank() if xpu_oneproc.enabled() else None
+        if r is not None:
+            pools = cls.__dict__.get("_oneproc_graph_pools")
+            if pools is None:
+                pools = {}
+                cls._oneproc_graph_pools = pools
+            if r not in pools:
+                pools[r] = self.graph_pool_handle()
+            return pools[r]
         if cls._global_graph_pool is None:
             cls._global_graph_pool = self.graph_pool_handle()
         return cls._global_graph_pool

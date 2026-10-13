@@ -184,7 +184,11 @@ class XPUWorker(Worker):
         # at load: "PermissionError: [Errno 13] Permission denied: ...\\_fused_post_conv_kernel.json"
         # from rank 1 while rank 0 wrote the same file. Per-rank directories cost one recompile per
         # rank on a cold cache and remove the race entirely.
-        if sys.platform == "win32":
+        # One process, two cards: the environment is shared by both rank threads and only one runs at a time, so one
+        # cache is both safe and right (a per-rank variable would just be overwritten by the other rank).
+        from vllm.distributed.device_communicators import xpu_oneproc
+
+        if sys.platform == "win32" and not xpu_oneproc.enabled():
             base = os.environ.get("TRITON_CACHE_DIR") or os.path.join(
                 os.path.expanduser("~"), ".triton", "cache"
             )

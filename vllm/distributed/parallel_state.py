@@ -465,6 +465,16 @@ class GroupCoordinator:
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
+        # One process, two cards (Windows XPU, v1/executor/oneproc_executor.py): both ranks are threads of this process,
+        # so every group is torch's thread-per-rank 'threaded' group, and there is no shared-memory message queue (its
+        # handshake blocks a rank on a socket the other rank, waiting for the baton, would never answer).
+        from vllm.distributed.device_communicators import xpu_oneproc
+
+        _one_process = xpu_oneproc.enabled()
+        if _one_process:
+            torch_distributed_backend = "threaded"
+            use_message_queue_broadcaster = False
+
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
         self.device_index: int
@@ -505,10 +515,14 @@ class GroupCoordinator:
                 )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
-                with suppress_stdout():
-                    cpu_group = torch.distributed.new_group(
-                        ranks, backend="gloo", timeout=timeout
-                    )
+                if _one_process:
+                    # the threaded group already moves CPU objects between the rank threads
+                    cpu_group = device_group
+                else:
+                    with suppress_stdout():
+                        cpu_group = torch.distributed.new_group(
+                            ranks, backend="gloo", timeout=timeout
+                        )
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)
@@ -1401,6 +1415,14 @@ class GroupCoordinator:
         # Release them before destroying the groups they depend on.
         if self.device_communicator is not None:
             self.device_communicator.destroy()
+        from vllm.distributed.device_communicators import xpu_oneproc
+
+        if xpu_oneproc.enabled():
+            # one process, two cards: the threaded groups belong to the rank threads' own torch worlds, and engine
+            # shutdown runs this from the main thread, where torch knows no such group ("Invalid process group
+            # specified", 2026-10-13 17:18). They go away with the process.
+            self.mq_broadcaster = None
+            return
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
@@ -1928,6 +1950,12 @@ def init_distributed_environment(
             )
             backend = "gloo"
         store = world_pg_store
+        from vllm.distributed.device_communicators import xpu_oneproc
+
+        if xpu_oneproc.enabled():
+            # one process, two cards: the rank threads meet in torch's 'threaded' group over one in-process store
+            backend = "threaded"
+            store = xpu_oneproc.store()
         if store is None and distributed_init_method.startswith("file://"):
             store = torch.distributed.FileStore(
                 distributed_init_method.removeprefix("file://"), world_size
@@ -1991,8 +2019,12 @@ def init_distributed_environment(
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
+        from vllm.distributed.device_communicators import xpu_oneproc
+
         if config is not None and config.parallel_config.nnodes > 1:
             _NODE_COUNT = config.parallel_config.nnodes
+        elif xpu_oneproc.enabled():
+            _NODE_COUNT = 1   # one process is one node
         else:
             _NODE_COUNT = _node_count(_WORLD.cpu_group)
         logger.debug("Detected %d nodes in the distributed environment", _NODE_COUNT)

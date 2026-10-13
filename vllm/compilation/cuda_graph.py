@@ -358,5 +358,16 @@ class CUDAGraphWrapper:
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
+        # one process, two cards (Windows XPU). Before the replay: let the other rank finish its own input preparation
+        # first, so the two cards start their graphs together (otherwise card 0 sits at the first exchange for as long
+        # as rank 1's host takes to prepare). After it: the replayed graph holds exchanges Python never sees, so the
+        # other rank must replay its graph before this one can block its host on anything after it.
+        from vllm.distributed.device_communicators import xpu_oneproc
+
+        one_process = xpu_oneproc.enabled()
+        if one_process and xpu_oneproc.ALIGN_REPLAYS:
+            xpu_oneproc.yield_baton()
         entry.cudagraph.replay()
+        if one_process:
+            xpu_oneproc.yield_baton()
         return entry.output

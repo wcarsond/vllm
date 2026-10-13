@@ -560,7 +560,16 @@ class CudaGraphManager:
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
+        # one process, two cards (Windows XPU): as in compilation/cuda_graph.py - hand over before the replay so both
+        # cards start together, and after it because the graph holds exchanges Python never sees
+        from vllm.distributed.device_communicators import xpu_oneproc
+
+        one_process = xpu_oneproc.enabled()
+        if one_process and xpu_oneproc.ALIGN_REPLAYS:
+            xpu_oneproc.yield_baton()
         self.graphs[desc].replay()
+        if one_process:
+            xpu_oneproc.yield_baton()
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:

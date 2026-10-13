@@ -39,8 +39,20 @@ class XpuCommunicator(DeviceCommunicatorBase):
         super().__init__(
             cpu_group, device, device_group, unique_name, use_all2all=use_all2all
         )
-        self.supports_tensor_dict = _RAM_RELAY
-        if _RAM_RELAY:
+        # One process, two cards (v1/executor/oneproc_executor.py): all_reduce and all_gather go through the exchange
+        # both rank threads share (xpu_oneproc.pair(): both cards' kernels read and write one pinned host buffer), each
+        # followed by a hand-over of the baton; everything else uses the threaded process groups directly.
+        from . import xpu_oneproc
+
+        self._one_process = xpu_oneproc.enabled() and self.world_size == 2
+        self._oneproc = xpu_oneproc
+        self._relay_on = _RAM_RELAY and not self._one_process
+        self.supports_tensor_dict = self._relay_on
+        if self._one_process:
+            self._exchange_wanted = False
+            logger.info_once("XPU on Windows, one process: two-card all_reduce and all_gather through the shared "
+                             "in-process exchange (xpu_exchange1p)")
+        elif _RAM_RELAY:
             from . import xpu_ram_relay
 
             self._relay = xpu_ram_relay
@@ -104,7 +116,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
     # _RAM_RELAY is set and otherwise falls through to the xccl path.
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
-        if not _RAM_RELAY:
+        if not self._relay_on:
             return super().send(tensor, dst)
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
@@ -113,7 +125,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
     ) -> torch.Tensor:
-        if not _RAM_RELAY:
+        if not self._relay_on:
             return super().recv(size, dtype, src)
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
@@ -122,15 +134,28 @@ class XpuCommunicator(DeviceCommunicatorBase):
     def send_tensor_dict(
         self, tensor_dict: dict[str, torch.Tensor | Any], dst: int
     ) -> None:
-        assert _RAM_RELAY, "tensor dict fast path is the Windows relay only"
+        assert self._relay_on, "tensor dict fast path is the Windows relay only"
         self._relay.send_tensor_dict(tensor_dict, self.ranks[dst], self.cpu_group)
 
     def recv_tensor_dict(self, src: int) -> dict[str, torch.Tensor | Any]:
-        assert _RAM_RELAY, "tensor dict fast path is the Windows relay only"
+        assert self._relay_on, "tensor dict fast path is the Windows relay only"
         return self._relay.recv_tensor_dict(self.ranks[src], self.cpu_group, self.device)
 
+    def _one_process_gather(self, input_: torch.Tensor) -> torch.Tensor:
+        """(2, *input_.shape) on this card: card 0's tensor, then card 1's (the group is ranks [0, 1] in card order)."""
+        flat = self._oneproc.exchange(input_.contiguous(), 1)
+        return flat.view((2,) + tuple(input_.shape))
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        if not _RAM_RELAY:
+        if self._one_process:
+            if dim < 0:
+                dim += input_.dim()
+            input_size = input_.size()
+            gathered = self._one_process_gather(input_).movedim(0, dim)
+            return gathered.reshape(
+                input_size[:dim] + (self.world_size * input_size[dim],) + input_size[dim + 1 :]
+            )
+        if not self._relay_on:
             return super().all_gather(input_, dim)
         if dim < 0:
             dim += input_.dim()
@@ -142,6 +167,8 @@ class XpuCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if self._one_process:
+            return self._oneproc.exchange(input_.contiguous(), 0)
         if _RAM_RELAY:
             if self._exchange_wanted:
                 if self._exchange is None:
@@ -196,7 +223,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
 
         assert input_tensor.shape[0] % world_size == 0
         chunk_size = input_tensor.shape[0] // world_size
-        if _RAM_RELAY:
+        if self._relay_on:
             output = self._relay.reduce_scatter(
                 input_tensor, chunk_size, world_size, self.cpu_group
             )
@@ -337,7 +364,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # For xpu path, gather doesn't work properly together with ray
         # cluster so we use all_gather instead for now.
         input_size = input_.size()
-        if _RAM_RELAY:
+        if self._one_process:
+            output_tensor = self._one_process_gather(input_)
+        elif self._relay_on:
             output_tensor = self._relay.all_gather(input_, self.world_size, self.cpu_group)
         else:
             # Allocate output tensor.
@@ -359,7 +388,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
         return output_tensor
 
     def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
-        if _RAM_RELAY:
+        if self._relay_on:
             self._relay.broadcast(input_, self.ranks[src], self.cpu_group)
             return
         dist.broadcast(input_, src=src, group=self.device_group)
