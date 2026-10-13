@@ -366,17 +366,35 @@ class XPUPlatform(Platform):
             and vllm_config.parallel_config.world_size > 1
             and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
-            # Windows, two cards: the collectives run through host memory (xpu_gpu_exchange.py / xpu_ram_relay.py), with a
-            # helper thread and host-side waits that a graph capture can neither record nor replay. Capturing recorded the
-            # exchange's kernels without running them and left both cards faulted at the first all_reduce (2026-10-11,
-            # PORT-NOTES "Triton dig"). torch.compile itself (fused kernels, fewer launches) stays on; only the graph
-            # replay goes.
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-            logger.warning_once(
-                "Windows XPU with %d cards: disabling cudagraph_mode (the host-memory "
-                "collectives cannot be captured); torch.compile stays on.",
-                vllm_config.parallel_config.world_size,
-            )
+            # Windows, two cards. Until 2026-10-13 graphs were off here: the exchange's helper thread and host-side waits
+            # could not be recorded (capturing left both cards faulted at the first all_reduce, 2026-10-11). The exchange
+            # is now graph-safe for decode-size all_reduces (<= 64 KB: sequence kept on the card, helper driven by headers
+            # the card writes; server/graph-test, 200 replays bit-exact). Larger all_reduces stay host-driven and refuse to
+            # be recorded, so keep only the capture sizes whose all_reduce (tokens x hidden x dtype) fits in 64 KB; larger
+            # batches (prefill) run without a graph. VLLM_XPU_TP_GRAPHS=0 restores graphs-off.
+            import os as _os
+            sizes = list(compilation_config.cudagraph_capture_sizes or [])
+            cap = 0
+            if _os.environ.get("VLLM_XPU_TP_GRAPHS", "1") != "0" and vllm_config.model_config is not None:
+                hidden = vllm_config.model_config.get_hidden_size()
+                elem = vllm_config.model_config.dtype.itemsize
+                cap = (64 << 10) // max(1, hidden * elem)
+                sizes = [s for s in sizes if s <= cap]
+            if sizes:
+                compilation_config.cudagraph_capture_sizes = sizes
+                compilation_config.max_cudagraph_capture_size = max(sizes)
+                logger.warning_once(
+                    "Windows XPU with %d cards: graph capture limited to batch sizes %s (each all_reduce <= 64 KB, the "
+                    "exchange's graph-safe path); larger batches run without a graph.",
+                    vllm_config.parallel_config.world_size, str(sizes),   # str: warning_once caches its args
+                )
+            else:
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                logger.warning_once(
+                    "Windows XPU with %d cards: disabling cudagraph_mode (VLLM_XPU_TP_GRAPHS=0, or no capture size "
+                    "fits the exchange's 64 KB graph-safe path; cap %d tokens); torch.compile stays on.",
+                    vllm_config.parallel_config.world_size, cap,
+                )
 
         if (
             vllm_config.model_config is not None

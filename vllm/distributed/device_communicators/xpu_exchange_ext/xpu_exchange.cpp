@@ -55,7 +55,11 @@
 namespace {
 
 constexpr size_t HEADER = 4096;
-constexpr size_t FLAG_OFF[2] = {0, 64};        // shared: per-rank published sequence, one cache line each
+// shared header: one cache line per word. SMALL/BIG = per-rank published sequence of each channel; HOSTCNT = per-rank
+// count of host calls (the eager guard)
+constexpr size_t FLAG_SMALL_OFF[2] = {0, 64};
+constexpr size_t FLAG_BIG_OFF[2] = {128, 192};
+constexpr size_t HOSTCNT_OFF[2] = {256, 320};
 constexpr int WG = 512;
 constexpr size_t SMALL = 64u << 10;            // one work-group per kernel up to here (data bytes)
 constexpr uint32_t SPIN_LIMIT = 6000000;       // polls per lane before it gives up: ~1 s at 150-180 ns a poll
@@ -69,6 +73,7 @@ inline double timeout_s() {
   return 600.0;
 }
 constexpr int RING = 1024;
+constexpr int HRING = 1024;                     // small-path job headers, card -> helper
 
 namespace iex = sycl::ext::intel::experimental;
 namespace oex = sycl::ext::oneapi::experimental;
@@ -182,12 +187,23 @@ static bool import_for_copy_engine(void* p, size_t bytes, Imported& out) {
   return !out.drivers.empty();
 }
 
+// GRAPH-SAFE LAYOUT (2026-10-13). Two channels, so the decode-size exchanges can be recorded into an XPU graph and replayed:
+//   small (<= 64 KB, decode): NOTHING per call on the host. The sequence number lives in card memory (dseq_): the export
+//     kernel reads s = dseq + 1, writes its tagged words into mine[s & 1] and a header word (bytes, tag s) into hdr_[s %
+//     HRING]; the add kernel reads the same s, waits for the peer's words tagged s in theirs[s & 1], adds, and its lane 0
+//     stores dseq = s. A replayed graph therefore gets a fresh s every time. The helper finds each job by watching hdr_
+//     (no host post), relays through its own small slots and SMALL flags.
+//   big (> 64 KB, prefill chunks): host-driven as before (host counter bseq_, posts, markers, BIG flags, direct copy-engine
+//     slots), and refused while the queue is recording a graph: its slot parity and markers are host values that a
+//     replay could not refresh. vLLM's capture sizes are capped so decode-size batches are the only ones captured.
+// The helper is one non-blocking loop that advances both channels, so neither can stall the other. A host-level guard
+// (each side's count of host calls, in the shared header) keeps eager callers in step; replays never touch the host.
 class Exchange {
  public:
   Exchange(int rank, int world_size, const std::string& name, size_t slot_bytes, int device_index)
       : rank_(rank), peer_(1 - rank), slot_bytes_(slot_bytes), device_index_(device_index) {
     if (world_size != 2) throw std::invalid_argument("xpu exchange is written for two cards");
-    const size_t total = HEADER + 4 * slot_bytes;
+    const size_t total = HEADER + 4 * slot_bytes + 4 * SMALL;
     if (rank == 0) {
       hmap_ = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, (DWORD)(total >> 32), (DWORD)(total & 0xffffffffu), name.c_str());
     } else {
@@ -196,19 +212,15 @@ class Exchange {
     if (!hmap_) throw std::runtime_error("xpu exchange: shared mapping '" + name + "' failed, error " + std::to_string(GetLastError()));
     base_ = reinterpret_cast<char*>(MapViewOfFile(hmap_, FILE_MAP_ALL_ACCESS, 0, 0, total));
     if (!base_) throw std::runtime_error("xpu exchange: MapViewOfFile failed, error " + std::to_string(GetLastError()));
-    if (rank == 0) std::memset(base_, 0, HEADER);   // flags; the slots need no zeroing
+    if (rank == 0) std::memset(base_, 0, HEADER);   // flags and host counts; the slots need no zeroing
     total_ = total;
     direct_ = import_for_copy_engine(base_, total, imported_);
-    { const char* f = std::getenv("VLLM_XPU_EXCHANGE_FUSED"); fused_ = f && std::string(f) == "1"; }
     { const char* a = std::getenv("VLLM_XPU_EXCHANGE_AHEAD"); int k = a ? std::atoi(a) : 1; ahead_ = k < 1 ? 1 : (k > 64 ? 64 : k); }
     sycl::context& ctx = c10::xpu::get_device_context();
     sycl::device& dev = c10::xpu::get_raw_device(device_index);
     for (int b = 0; b < 2; ++b) {
-      // small path: tagged words, 8 bytes per data word, up to SMALL data bytes
       mine_[b] = static_cast<uint64_t*>(sycl::malloc_host(2 * SMALL, ctx));
       theirs_[b] = static_cast<uint64_t*>(sycl::malloc_host(2 * SMALL, ctx));
-      // big path: plain bytes moved by the copy engine, a tagged marker word for the handover; with the section
-      // imported (direct_) the copy engine uses the shared slots themselves and no private staging is needed
       if (!direct_) {
         mine_plain_[b] = static_cast<char*>(sycl::malloc_host(slot_bytes, ctx));
         theirs_plain_[b] = static_cast<char*>(sycl::malloc_host(slot_bytes, ctx));
@@ -218,12 +230,16 @@ class Exchange {
     status_ = static_cast<int64_t*>(sycl::malloc_host(2 * 64, ctx));
     marker_mine_ = static_cast<int64_t*>(sycl::malloc_host(2 * 64, ctx));
     marker_theirs_ = static_cast<int64_t*>(sycl::malloc_host(2 * 64, ctx));
+    hdr_ = static_cast<uint64_t*>(sycl::malloc_host(HRING * sizeof(uint64_t), ctx));
+    dseq_ = static_cast<int64_t*>(sycl::malloc_device(64, dev, ctx));
     for (int b = 0; b < 2; ++b)
       if (!mine_[b] || !theirs_[b] || (!direct_ && (!mine_plain_[b] || !theirs_plain_[b])) || !theirs_dev_[b])
         throw std::runtime_error("xpu exchange: USM allocation failed");
-    if (!status_ || !marker_mine_ || !marker_theirs_) throw std::runtime_error("xpu exchange: USM allocation failed");
+    if (!status_ || !marker_mine_ || !marker_theirs_ || !hdr_ || !dseq_) throw std::runtime_error("xpu exchange: USM allocation failed");
     for (int b = 0; b < 2; ++b) { std::memset(mine_[b], 0, 2 * SMALL); std::memset(theirs_[b], 0, 2 * SMALL); }
     std::memset(status_, 0, 2 * 64); std::memset(marker_mine_, 0, 2 * 64); std::memset(marker_theirs_, 0, 2 * 64);
+    std::memset(hdr_, 0, HRING * sizeof(uint64_t));
+    c10::xpu::getCurrentXPUStream(device_index).queue().memset(dseq_, 0, 64).wait();
     helper_ = std::thread(&Exchange::helper_main, this);
   }
 
@@ -233,8 +249,7 @@ class Exchange {
   // without a second round of Python checks per layer; raises if an earlier exchange failed.
   // Out of place on purpose: vLLM registers all_reduce as a functional custom op (the fake returns empty_like), so under
   // torch.compile Inductor reuses the input's buffer right after the call; an in-place result was overwritten by the next
-  // kernel and the compiled two-card run produced garbage (2026-10-11 12:00). The add kernel writes a fresh tensor, no
-  // extra launch.
+  // kernel and the compiled two-card run produced garbage (2026-10-11 12:00).
   std::optional<at::Tensor> try_all_reduce_(const at::Tensor& t) {
     if (!t.is_xpu() || !t.is_contiguous()) return std::nullopt;
     const size_t bytes = (size_t)t.numel() * t.element_size();
@@ -271,147 +286,137 @@ class Exchange {
     at::Tensor out = at::empty_like(t);
     if (bytes == 0) return out;
     sycl::queue& q = c10::xpu::getCurrentXPUStream(t.device().index()).queue();
-    const int64_t seq = ++seq_;
-    const uint32_t tag = (uint32_t)seq;
-    const int b = (int)(seq & 1);
+    const bool recording = q.ext_oneapi_get_state() == oex::queue_state::recording;
     uint32_t* x = static_cast<uint32_t*>(t.data_ptr());
     uint32_t* y = static_cast<uint32_t*>(out.data_ptr());
     const size_t nwords = bytes / 4;
-    if (bytes <= SMALL) ++n_small_; else ++n_big_;
     if (bytes <= SMALL) {
-      // Small path, two launches: the export goes out *before* the guard so the helper can start the hop while the
-      // guard runs (one merged kernel launched after the guard measured 46.0 against 47.1 tok/s, 11:40). The export
-      // has no barrier: the helper validates every word's tag. The 8-byte stores stay scalar: a 32-byte vector store
-      // with the uncached hint ran ~80x slower (14.7 MB in 400 ms instead of 5 ms; 10:15).
-      uint64_t* mine = mine_[b];
-      const uint64_t* theirs = theirs_[b];
-      int64_t* status = status_;
-      if (fused_) {
-        // One kernel per all_reduce (VLLM_XPU_EXCHANGE_FUSED=1, 2026-10-13), launched BEFORE the guard as the export
-        // was: every lane writes its tagged words, then waits for the peer's and adds. Saves one launch and one
-        // dispatch gap per exchange (Linux's oneCCL LL256 does it in one kernel: 13 us against our 28). All 512 lanes are
-        // one work-group, resident together, so every export is written before any lane can block on its poll. The
-        // earlier fused try (11:40, 2026-10-11) launched AFTER the guard and lost: the export waited on the host.
-        // MEASURED 2026-10-13: no gain (7 KB back to back 28.3 us fused vs 27.8 two kernels, both bit-exact), so the
-        // launch count is not the cost; the round trip through the two CPU helpers is. Kept off by default, for the
-        // record. probe/one-process-pingpong: two cards in ONE process polling one host buffer do 7 KB in 14.3 us one
-        // way, i.e. a helper-free exchange would match oneCCL's 13 us, but only with a single-process two-card executor.
-        switch (dt) {
-          case F32: fused_kernel<F32>(q, x, y, mine, theirs, status, seq, tag, nwords); break;
-          case BF16: fused_kernel<BF16>(q, x, y, mine, theirs, status, seq, tag, nwords); break;
-          default: fused_kernel<F16>(q, x, y, mine, theirs, status, seq, tag, nwords); break;
-        }
-        post(seq, bytes);
-        guard(seq);
-        return out;
-      }
+      // Small path: everything the call needs is read from card memory at run time, so the two kernels can be recorded
+      // once and replayed. Export: tagged words into mine[s & 1] and the job header for the helper.
+      ++n_small_;
+      if (recording) ++n_recorded_;
+      uint64_t* m0 = mine_[0];
+      uint64_t* m1 = mine_[1];
+      uint64_t* hdr = hdr_;
+      const int64_t* dseq_r = dseq_;
+      const uint32_t nb = (uint32_t)bytes;
       q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
-        uncached_wptr<uint64_t> m{mine};
-        for (size_t i = it.get_local_id(0); i < nwords; i += WG) m[i] = tagged(x[i], tag);
+        const int64_t s = dseq_r[0] + 1;
+        const uint32_t tag = (uint32_t)s;
+        uncached_wptr<uint64_t> m{(s & 1) ? m1 : m0};
+        const size_t lid = it.get_local_id(0);
+        for (size_t i = lid; i < nwords; i += WG) m[i] = tagged(x[i], tag);
+        if (lid == 0) { uncached_wptr<uint64_t> h{hdr + (size_t)(s % HRING)}; h[0] = tagged(nb, tag); }
       });
-      post(seq, bytes);
-      guard(seq);
+      guard();
+      const uint64_t* t0 = theirs_[0];
+      const uint64_t* t1 = theirs_[1];
+      int64_t* dseq = dseq_;
+      int64_t* status = status_;
       switch (dt) {
-        case F32: add_kernel<F32>(q, x, y, theirs, status, seq, tag, nwords); break;
-        case BF16: add_kernel<BF16>(q, x, y, theirs, status, seq, tag, nwords); break;
-        default: add_kernel<F16>(q, x, y, theirs, status, seq, tag, nwords); break;
+        case F32: add_kernel<F32>(q, x, y, t0, t1, dseq, status, nwords); break;
+        case BF16: add_kernel<BF16>(q, x, y, t0, t1, dseq, status, nwords); break;
+        default: add_kernel<F16>(q, x, y, t0, t1, dseq, status, nwords); break;
       }
       return out;
-    } else {
-      // Big path (prefill chunks, MBs): the copy engine moves the bytes into pinned host memory at PCIe speed, then a
-      // one-lane kernel, which the in-order queue starts only after the copy has completed, stores the sequence into
-      // the marker line. Tagging every word of a 14.7 MB tensor with 8-byte stores took ~8 ms; this takes ~1.5.
-      // direct_: straight into my slot of the shared section (imported for the copy engine), no helper memcpy later
-      q.memcpy(direct_ ? slot(rank_, b) : mine_plain_[b], x, bytes);
-      int64_t* marker = marker_mine_ + b * 8;
-      q.single_task([=]() { uncached_wptr<int64_t> m{marker}; m[0] = seq; });
     }
+    // Big path (prefill chunks, MBs): host-driven, so never inside a graph.
+    TORCH_CHECK(!recording, "xpu exchange: an all_reduce of ", bytes, " B (over 64 KB) inside an XPU graph capture: the "
+                "large path is host-driven and a replay would reuse stale slots. Cap the cudagraph capture sizes so only "
+                "decode-size batches are captured.");
+    ++n_big_;
+    const int64_t seq = ++bseq_;
+    const int b = (int)(seq & 1);
+    // the copy engine moves the bytes straight into my slot of the imported section (direct_) or into pinned staging;
+    // a one-lane kernel, started by the in-order queue only after the copy, stores the marker the helper waits for
+    q.memcpy(direct_ ? slot(rank_, b) : mine_plain_[b], x, bytes);
+    int64_t* marker = marker_mine_ + b * 8;
+    q.single_task([=]() { uncached_wptr<int64_t> m{marker}; m[0] = seq; });
     post(seq, bytes);
-    guard(seq);
+    guard();
     int64_t* status = status_;
-    {
-      // K2a: one lane waits for the helper's marker (the peer's half is complete in theirs_plain[b] and flushed to
-      // memory); then the copy engine brings it into card memory; then K2b adds from card memory (a fresh kernel,
-      // plain loads: the coherence probe found copies into card memory visible to the next kernel in every case).
-      const int64_t* marker = marker_theirs_ + b * 8;
-      q.single_task([=]() {
-        uncached_rptr<const int64_t> r{marker};
-        uint32_t polls = 0;
-        for (;;) {
-          int64_t v = r[0];
-          sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-          if (v >= seq) break;
-          if (++polls > SPIN_LIMIT) { uncached_wptr<int64_t> s{status}; if (s[0] == 0) s[0] = seq; break; }
-        }
-      });
-      // direct_: straight out of the peer's slot. Reuse is safe: my copy into slot b at s+2 runs after my poll at s+1,
-      // which needs the peer's flag s+1, which the peer publishes only after its card has read my slot b at s (its queue
-      // is in order: copy-out s, add s, copy-in s+1, marker s+1).
-      q.memcpy(theirs_dev_[b], direct_ ? slot(peer_, b) : theirs_plain_[b], bytes);
-      const uint32_t* theirs = reinterpret_cast<const uint32_t*>(theirs_dev_[b]);
-      switch (dt) {
-        case F32: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<F32>(x[i], theirs[i]); }); break;
-        case BF16: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<BF16>(x[i], theirs[i]); }); break;
-        default: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<F16>(x[i], theirs[i]); }); break;
+    const int64_t* marker_t = marker_theirs_ + b * 8;
+    q.single_task([=]() {
+      uncached_rptr<const int64_t> r{marker_t};
+      uint32_t polls = 0;
+      for (;;) {
+        int64_t v = r[0];
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        if (v >= seq) break;
+        if (++polls > SPIN_LIMIT) { uncached_wptr<int64_t> s{status}; if (s[0] == 0) s[0] = -seq; break; }
       }
+    });
+    // straight out of the peer's slot (direct_). Reuse is safe: my copy into slot b at seq+2 runs after my poll at seq+1,
+    // which needs the peer's BIG flag seq+1, published only after its card has read my slot b at seq.
+    q.memcpy(theirs_dev_[b], direct_ ? slot(peer_, b) : theirs_plain_[b], bytes);
+    const uint32_t* theirs = reinterpret_cast<const uint32_t*>(theirs_dev_[b]);
+    switch (dt) {
+      case F32: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<F32>(x[i], theirs[i]); }); break;
+      case BF16: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<BF16>(x[i], theirs[i]); }); break;
+      default: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<F16>(x[i], theirs[i]); }); break;
     }
     return out;
   }
 
+  // small path add, one work-group: s from card memory, wait for the peer's words tagged s (four per 32-byte load, scalar
+  // tail), add into the fresh output, then lane 0 advances dseq (after a barrier: every lane has read it by then)
+  template <int DT>
+  static void add_kernel(sycl::queue& q, const uint32_t* x, uint32_t* y, const uint64_t* t0, const uint64_t* t1,
+                         int64_t* dseq, int64_t* status, size_t nwords) {
+    const size_t nvec = nwords / 4;
+    q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+      const int64_t s = dseq[0] + 1;
+      const uint32_t tag = (uint32_t)s;
+      const uint64_t* theirs = (s & 1) ? t1 : t0;
+      const size_t lid = it.get_local_id(0);
+      for (size_t v = lid; v < nvec; v += WG) {
+        u64x4 w = wait_tagged4(theirs + 4 * v, tag, s, status);
+        size_t i = 4 * v;
+        y[i] = add_words<DT>(x[i], data_of(w[0]));
+        y[i + 1] = add_words<DT>(x[i + 1], data_of(w[1]));
+        y[i + 2] = add_words<DT>(x[i + 2], data_of(w[2]));
+        y[i + 3] = add_words<DT>(x[i + 3], data_of(w[3]));
+      }
+      for (size_t i = 4 * nvec + lid; i < nwords; i += WG)
+        y[i] = add_words<DT>(x[i], data_of(wait_tagged(theirs + i, tag, s, status)));
+      sycl::group_barrier(it.get_group());
+      if (lid == 0) dseq[0] = s;
+    });
+  }
+
  public:
   bool direct() const { return direct_; }
-  // (gpu_timeout_seq, helper_timeout_seq, sequence): zero means no failure so far
+  // (card_timeout_seq, helper_timeout_seq, host_calls): zeros mean healthy; a negative card value is a big-path sequence
   std::tuple<int64_t, int64_t, int64_t> status() const {
-    return {reinterpret_cast<volatile int64_t*>(status_)[0], reinterpret_cast<volatile int64_t*>(status_)[8], seq_};
+    return {reinterpret_cast<volatile int64_t*>(status_)[0], reinterpret_cast<volatile int64_t*>(status_)[8], host_calls_};
   }
+
+  // calls made from the host so far, small ones while a graph was being recorded, and big ones
+  std::tuple<int64_t, int64_t, int64_t> counts() const { return {n_small_, n_recorded_, n_big_}; }
 
   // Everything the two sides have said to each other, for the log when an all_reduce fails.
   std::string debug() {
     volatile int64_t* st = reinterpret_cast<volatile int64_t*>(status_);
-    volatile int64_t* my_flag = reinterpret_cast<volatile int64_t*>(base_ + FLAG_OFF[rank_]);
-    volatile int64_t* peer_flag = reinterpret_cast<volatile int64_t*>(base_ + FLAG_OFF[peer_]);
-    std::string s = "rank " + std::to_string(rank_) + ": seq " + std::to_string(seq_) +
-        ", gpu_timeout_at " + std::to_string(st[0]) + ", helper_timeout_at " + std::to_string(st[8]) +
-        ", my_flag " + std::to_string(*my_flag) + ", peer_flag " + std::to_string(*peer_flag) +
-        ", helper head " + std::to_string(head_.load()) + " tail " + std::to_string(tail_.load()) +
-        ", small/big calls " + std::to_string(n_small_) + "/" + std::to_string(n_big_) + ", last jobs:";
-    int64_t h = head_.load();
-    for (int64_t i = std::max<int64_t>(0, h - 6); i < h; ++i)
-      s += " (" + std::to_string(ring_[i % RING].seq) + ", " + std::to_string(ring_[i % RING].bytes) + " B)";
-    auto words = [](const uint64_t* p) {
-      char buf[80];
-      std::snprintf(buf, sizeof buf, "%08x@%u %08x@%u", data_of(p[0]), tag_of(p[0]), data_of(p[1]), tag_of(p[1]));
-      return std::string(buf);
-    };
-    auto plain = [](const char* p) {
-      char buf[40];
-      const uint32_t* w = reinterpret_cast<const uint32_t*>(p);
-      std::snprintf(buf, sizeof buf, "%08x %08x", w[0], w[1]);
-      return std::string(buf);
-    };
-    for (int b = 0; b < 2; ++b) {
-      s += "; buf" + std::to_string(b) + " mine=" + words(mine_[b]) + " myslot=" + plain(slot(rank_, b)) +
-           " peerslot=" + plain(slot(peer_, b)) + " theirs=" + words(theirs_[b]);
-    }
-    s += "; helper stage times in us for the last jobs (wait_for_card, memcpy_in, wait_for_peer, write_out, -):";
-    int64_t tl = tail_.load();
-    for (int64_t i = std::max<int64_t>(1, tl - 5); i <= tl && i >= 1; ++i) {
-      const Stat& st2 = stats_[i % STATS];
-      if (st2.seq != i) continue;
-      char buf[200];
-      std::snprintf(buf, sizeof buf, " #%lld[%zu B: %.0f, %.0f, %.0f, %.0f, %.0f]", (long long)st2.seq, st2.bytes, st2.wait_done, st2.memcpy_in, st2.wait_peer, st2.memcpy_out, st2.enqueue);
-      s += buf;
-    }
+    auto word = [&](size_t off) { return std::to_string(*reinterpret_cast<volatile int64_t*>(base_ + off)); };
+    std::string s = "rank " + std::to_string(rank_) + ": host calls " + std::to_string(host_calls_) +
+        " (small " + std::to_string(n_small_) + ", recorded " + std::to_string(n_recorded_) + ", big " + std::to_string(n_big_) +
+        "), card_timeout_at " + std::to_string(st[0]) + ", helper_timeout_at " + std::to_string(st[8]) +
+        ", small flags mine/peer " + word(FLAG_SMALL_OFF[rank_]) + "/" + word(FLAG_SMALL_OFF[peer_]) +
+        ", big flags mine/peer " + word(FLAG_BIG_OFF[rank_]) + "/" + word(FLAG_BIG_OFF[peer_]) +
+        ", host counts mine/peer " + word(HOSTCNT_OFF[rank_]) + "/" + word(HOSTCNT_OFF[peer_]) +
+        ", helper next small " + std::to_string(next_small_.load()) + ", big head/tail " + std::to_string(head_.load()) + "/" +
+        std::to_string(tail_.load()) + ", direct " + (direct_ ? "yes" : "no");
     return s;
   }
 
-  // the helper's stage timings for the last `n` jobs, newest last: (seq, bytes, wait_for_card, memcpy_in, wait_for_peer, write_out, 0) in us
+  // the helper's stage timings for the last `n` jobs of either channel, oldest first:
+  // (seq, bytes, wait_for_card, publish, wait_for_peer, write_out, 0) in us; big jobs carry a negative seq
   std::vector<std::tuple<int64_t, size_t, double, double, double, double, double>> stats(int n) const {
     std::vector<std::tuple<int64_t, size_t, double, double, double, double, double>> out;
-    int64_t tl = tail_.load();
-    for (int64_t i = std::max<int64_t>(1, tl - n + 1); i <= tl; ++i) {
+    const int64_t c = stat_count_.load();
+    for (int64_t i = std::max<int64_t>(0, c - n); i < c; ++i) {
       const Stat& st = stats_[i % STATS];
-      if (st.seq == i) out.emplace_back(st.seq, st.bytes, st.wait_done, st.memcpy_in, st.wait_peer, st.memcpy_out, st.enqueue);
+      out.emplace_back(st.seq, st.bytes, st.wait_done, st.memcpy_in, st.wait_peer, st.memcpy_out, st.enqueue);
     }
     return out;
   }
@@ -432,6 +437,8 @@ class Exchange {
     if (status_) sycl::free(status_, ctx);
     if (marker_mine_) sycl::free(marker_mine_, ctx);
     if (marker_theirs_) sycl::free(marker_theirs_, ctx);
+    if (hdr_) sycl::free(hdr_, ctx);
+    if (dseq_) sycl::free(dseq_, ctx);
     for (auto& d : imported_.drivers) if (d.second && base_) d.second(d.first, base_);
     imported_.drivers.clear();
     if (base_) UnmapViewOfFile(base_);
@@ -439,77 +446,30 @@ class Exchange {
   }
 
  private:
-  // Before the card is told to wait for the peer's half of s, make sure the peer has at least published s-1 (a plain
-  // read of the shared flag). In lockstep this costs nothing; it keeps the Python thread at most one all_reduce ahead
-  // of the slower card, so the GPU wait only ever covers one layer of peer work plus the hop, never a JIT compile or
-  // a scheduler hiccup on the other side. A peer that is gone shows up here as a 60 s timeout.
-  //
-  // VLLM_XPU_EXCHANGE_AHEAD=K (2026-10-13, default 1 = the behaviour above): wait only for the peer's s-K, so the Python
-  // thread can queue up to K all_reduces (and the layers between them) ahead of the cards. Correctness does not depend
-  // on K: buffer reuse is ordered by the cards' in-order queues and the helper's in-order jobs (a card cannot export s+2
-  // before its add s+1 has seen the peer's s+1, which the peer's helper publishes only after it has read my slot for s).
-  // What K trades: a larger K hides the CPU's launch and Python time behind card work in two-card decode, but a peer
-  // that stalls (a JIT compile, a scheduler hiccup) then leaves more queued card work spinning toward SPIN_LIMIT.
-  void guard(int64_t seq) {
-    if (seq <= ahead_) return;
-    volatile int64_t* peer_flag = reinterpret_cast<volatile int64_t*>(base_ + FLAG_OFF[peer_]);
-    if (!wait_word(peer_flag, seq - ahead_, stop_))
-      throw std::runtime_error("xpu exchange: the peer never reached all_reduce #" + std::to_string(seq - ahead_) + " within " +
+  // Keep the two hosts in step: publish my count of host calls, then wait until the peer has made at least as many
+  // (minus VLLM_XPU_EXCHANGE_AHEAD - 1). The export is already queued, so both sides queue their export, then meet here;
+  // the card's add therefore waits only for the peer's CARD, never for a peer host that is still compiling. Graph
+  // replays do not come through here at all.
+  void guard() {
+    const int64_t mine = ++host_calls_;
+    volatile int64_t* my = reinterpret_cast<volatile int64_t*>(base_ + HOSTCNT_OFF[rank_]);
+    volatile int64_t* pe = reinterpret_cast<volatile int64_t*>(base_ + HOSTCNT_OFF[peer_]);
+    *my = mine;
+    const int64_t want = mine - (ahead_ - 1);
+    if (want <= 0) return;
+    if (!wait_word(pe, want, stop_))
+      throw std::runtime_error("xpu exchange: the peer never made host call #" + std::to_string(want) + " within " +
                                std::to_string((int)timeout_s()) + " s (peer gone or stalled; VLLM_XPU_EXCHANGE_TIMEOUT_S)");
-  }
-
-  // small path add kernel, one work-group: wait for the peer's tagged words (four per 32-byte load, scalar tail) and
-  // add them in place
-  template <int DT>
-  static void add_kernel(sycl::queue& q, const uint32_t* x, uint32_t* y, const uint64_t* theirs, int64_t* status,
-                         int64_t seq, uint32_t tag, size_t nwords) {
-    const size_t nvec = nwords / 4;
-    q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
-      size_t lid = it.get_local_id(0);
-      for (size_t v = lid; v < nvec; v += WG) {
-        u64x4 w = wait_tagged4(theirs + 4 * v, tag, seq, status);
-        size_t i = 4 * v;
-        y[i] = add_words<DT>(x[i], data_of(w[0]));
-        y[i + 1] = add_words<DT>(x[i + 1], data_of(w[1]));
-        y[i + 2] = add_words<DT>(x[i + 2], data_of(w[2]));
-        y[i + 3] = add_words<DT>(x[i + 3], data_of(w[3]));
-      }
-      for (size_t i = 4 * nvec + lid; i < nwords; i += WG)
-        y[i] = add_words<DT>(x[i], data_of(wait_tagged(theirs + i, tag, seq, status)));
-    });
-  }
-
-  // small path, fused: export my tagged words, then wait for the peer's and add (one work-group, see run())
-  template <int DT>
-  static void fused_kernel(sycl::queue& q, const uint32_t* x, uint32_t* y, uint64_t* mine, const uint64_t* theirs,
-                           int64_t* status, int64_t seq, uint32_t tag, size_t nwords) {
-    const size_t nvec = nwords / 4;
-    q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
-      size_t lid = it.get_local_id(0);
-      {
-        uncached_wptr<uint64_t> m{mine};
-        for (size_t i = lid; i < nwords; i += WG) m[i] = tagged(x[i], tag);
-      }
-      for (size_t v = lid; v < nvec; v += WG) {
-        u64x4 w = wait_tagged4(theirs + 4 * v, tag, seq, status);
-        size_t i = 4 * v;
-        y[i] = add_words<DT>(x[i], data_of(w[0]));
-        y[i + 1] = add_words<DT>(x[i + 1], data_of(w[1]));
-        y[i + 2] = add_words<DT>(x[i + 2], data_of(w[2]));
-        y[i + 3] = add_words<DT>(x[i + 3], data_of(w[3]));
-      }
-      for (size_t i = 4 * nvec + lid; i < nwords; i += WG)
-        y[i] = add_words<DT>(x[i], data_of(wait_tagged(theirs + i, tag, seq, status)));
-    });
   }
 
   void check_status() const {
     volatile int64_t* s = reinterpret_cast<volatile int64_t*>(status_);
-    if (s[0] != 0) throw std::runtime_error("xpu exchange: the card waited too long for the peer's half at all_reduce #" + std::to_string(s[0]) + " (peer gone or stalled); results after that point are invalid");
+    if (s[0] != 0) throw std::runtime_error("xpu exchange: the card waited too long for the peer's half at all_reduce #" + std::to_string(s[0]) + " (negative = big path; peer gone or stalled); results after that point are invalid");
     if (s[8] != 0) throw std::runtime_error("xpu exchange: the helper thread gave up waiting at all_reduce #" + std::to_string(s[8]) + " (peer gone or stalled; VLLM_XPU_EXCHANGE_TIMEOUT_S)");
   }
 
   char* slot(int rank, int b) const { return base_ + HEADER + (size_t)(rank * 2 + b) * slot_bytes_; }
+  char* small_slot(int rank, int b) const { return base_ + HEADER + 4 * slot_bytes_ + (size_t)(rank * 2 + b) * SMALL; }
 
   void post(int64_t seq, size_t bytes) {
     int64_t h = head_.load(std::memory_order_relaxed);
@@ -533,9 +493,8 @@ class Exchange {
     }
   }
 
-  // Read the card's tagged export of job `seq` into `dst` (plain data words). Every word must carry the tag; a word that
-  // does not yet is re-read after invalidating its cache line (the card's write may still be on its way, and the CPU's
-  // cached copy of the line is not invalidated by it). False on timeout.
+  // Read the card's tagged export into `dst` (plain data words). Every word must carry the tag; a word that does not yet
+  // is re-read after invalidating its cache line. False on timeout.
   bool collect_export(uint32_t* dst, const uint64_t* src, size_t nwords, uint32_t tag) {
     auto t0 = std::chrono::steady_clock::now();
     const double limit = timeout_s();
@@ -558,65 +517,122 @@ class Exchange {
     return true;
   }
 
+  void record(int64_t seq, size_t bytes, double a, double b2, double c, double d) {
+    const int64_t i = stat_count_.load(std::memory_order_relaxed);
+    stats_[i % STATS] = Stat{seq, bytes, a, b2, c, d, 0.0};
+    stat_count_.store(i + 1, std::memory_order_release);
+  }
+
+  // One loop, two channels, never blocking on either: a stalled channel must not hold up the other, because the card runs
+  // them interleaved in program order.
   void helper_main() {
-    volatile int64_t* my_flag = reinterpret_cast<volatile int64_t*>(base_ + FLAG_OFF[rank_]);
-    volatile int64_t* peer_flag = reinterpret_cast<volatile int64_t*>(base_ + FLAG_OFF[peer_]);
+    using clk = std::chrono::steady_clock;
+    auto us = [](clk::time_point a, clk::time_point b2) { return std::chrono::duration<double, std::micro>(b2 - a).count(); };
+    volatile int64_t* fs_my = reinterpret_cast<volatile int64_t*>(base_ + FLAG_SMALL_OFF[rank_]);
+    volatile int64_t* fs_peer = reinterpret_cast<volatile int64_t*>(base_ + FLAG_SMALL_OFF[peer_]);
+    volatile int64_t* fb_my = reinterpret_cast<volatile int64_t*>(base_ + FLAG_BIG_OFF[rank_]);
+    volatile int64_t* fb_peer = reinterpret_cast<volatile int64_t*>(base_ + FLAG_BIG_OFF[peer_]);
     volatile int64_t* status = reinterpret_cast<volatile int64_t*>(status_);
+    const double limit = timeout_s();
+    int64_t sn = 1;          // the next small sequence the card will export
+    int sst = 0;             // 0: waiting for its header, 1: published, waiting for the peer
+    size_t sbytes = 0;
+    clk::time_point s0, s1, s2;
+    int bst = 0;             // big channel: 0: waiting for a posted job's marker, 1: published, waiting for the peer
+    Job bj{0, 0};
+    clk::time_point b0, b1;
+    clk::time_point last = clk::now();
+    bool failed = false;
     while (!stop_.load(std::memory_order_acquire)) {
-      int64_t t = tail_.load(std::memory_order_acquire);
-      if (t == head_.load(std::memory_order_acquire)) { _mm_pause(); continue; }
-      Job job = ring_[t % RING];
-      int b = (int)(job.seq & 1);
-      uint32_t tag = (uint32_t)job.seq;
-      size_t nwords = job.bytes / 4;
-      using clk = std::chrono::steady_clock;
-      auto us = [](clk::time_point a, clk::time_point b2) { return std::chrono::duration<double, std::micro>(b2 - a).count(); };
-      const bool small = job.bytes <= SMALL;
-      auto t0 = clk::now();
-      // 1. the card's half into my shared slot
-      if (small) {
-        // checked word by word
-        if (!collect_export(reinterpret_cast<uint32_t*>(slot(rank_, b)), mine_[b], nwords, tag)) {
-          if (!stop_) status[8] = job.seq; tail_.store(t + 1); continue;
+      bool moved = false;
+      // ---- small channel
+      if (sst == 0) {
+        volatile uint64_t* h = reinterpret_cast<volatile uint64_t*>(hdr_ + (size_t)(sn % HRING));
+        _mm_clflush(const_cast<const uint64_t*>(h));
+        _mm_mfence();
+        const uint64_t hv = *h;
+        if (tag_of(hv) == (uint32_t)sn) {
+          s0 = clk::now();
+          sbytes = data_of(hv);
+          const int b = (int)(sn & 1);
+          if (!collect_export(reinterpret_cast<uint32_t*>(small_slot(rank_, b)), mine_[b], sbytes / 4, (uint32_t)sn)) {
+            if (!stop_) status[8] = sn;
+            failed = true;
+          } else {
+            MemoryBarrier();
+            *fs_my = sn;
+            s1 = clk::now();
+            sst = 1;
+            moved = true;
+          }
         }
-      } else {
-        // the marker says the copy engine has finished; drop this core's stale lines, then copy
-        if (!wait_word(reinterpret_cast<volatile int64_t*>(marker_mine_) + b * 8, job.seq, stop_, /*card_written=*/true)) {
-          if (!stop_) status[8] = job.seq; tail_.store(t + 1); continue;
-        }
-        if (!direct_) {
-          invalidate_lines(mine_plain_[b], job.bytes);
-          _mm_mfence();
-          std::memcpy(slot(rank_, b), mine_plain_[b], job.bytes);
-        }
-      }
-      auto t1 = clk::now();
-      MemoryBarrier();
-      *my_flag = job.seq;
-      auto t2 = clk::now();
-      // 2. the peer's half
-      if (!wait_word(peer_flag, job.seq, stop_)) { if (!stop_) status[8] = job.seq; tail_.store(t + 1); continue; }
-      auto t3 = clk::now();
-      MemoryBarrier();
-      if (small) {
-        const uint32_t* peer = reinterpret_cast<const uint32_t*>(slot(peer_, b));
+      } else if (*fs_peer >= sn) {
+        s2 = clk::now();
+        MemoryBarrier();
+        const int b = (int)(sn & 1);
+        const uint32_t* peer = reinterpret_cast<const uint32_t*>(small_slot(peer_, b));
         uint64_t* out = theirs_[b];
+        const size_t nwords = sbytes / 4;
+        const uint32_t tag = (uint32_t)sn;
         for (size_t i = 0; i < nwords; ++i) out[i] = tagged(peer[i], tag);
         // push the tagged words out of this core's cache so the card's cache-bypassing loads find them in memory
         invalidate_lines(out, nwords * sizeof(uint64_t));
         _mm_mfence();
-      } else {
+        record(sn, sbytes, 0.0, us(s0, s1), us(s1, s2), us(s2, clk::now()));
+        next_small_.store(sn + 1, std::memory_order_relaxed);
+        ++sn;
+        sst = 0;
+        moved = true;
+      }
+      // ---- big channel
+      if (bst == 0) {
+        const int64_t t = tail_.load(std::memory_order_acquire);
+        if (t < head_.load(std::memory_order_acquire)) {
+          bj = ring_[t % RING];
+          volatile int64_t* m = reinterpret_cast<volatile int64_t*>(marker_mine_) + (bj.seq & 1) * 8;
+          _mm_clflush(const_cast<const int64_t*>(m));
+          _mm_mfence();
+          if (*m >= bj.seq) {
+            b0 = clk::now();
+            const int b = (int)(bj.seq & 1);
+            if (!direct_) {
+              invalidate_lines(mine_plain_[b], bj.bytes);
+              _mm_mfence();
+              std::memcpy(slot(rank_, b), mine_plain_[b], bj.bytes);
+            }
+            MemoryBarrier();
+            *fb_my = bj.seq;
+            b1 = clk::now();
+            bst = 1;
+            moved = true;
+          }
+        }
+      } else if (*fb_peer >= bj.seq) {
+        auto b2 = clk::now();
+        MemoryBarrier();
+        const int b = (int)(bj.seq & 1);
         if (!direct_) {
-          std::memcpy(theirs_plain_[b], slot(peer_, b), job.bytes);
-          invalidate_lines(theirs_plain_[b], job.bytes);
+          std::memcpy(theirs_plain_[b], slot(peer_, b), bj.bytes);
+          invalidate_lines(theirs_plain_[b], bj.bytes);
         }
         _mm_mfence();
-        reinterpret_cast<volatile int64_t*>(marker_theirs_)[b * 8] = job.seq;   // the card's one-lane kernel polls this
+        reinterpret_cast<volatile int64_t*>(marker_theirs_)[b * 8] = bj.seq;   // the card's one-lane kernel polls this
         _mm_mfence();
+        record(-bj.seq, bj.bytes, 0.0, us(b0, b1), us(b1, b2), us(b2, clk::now()));
+        tail_.store(tail_.load() + 1, std::memory_order_release);
+        bst = 0;
+        moved = true;
       }
-      auto t4 = clk::now();
-      stats_[job.seq % STATS] = Stat{job.seq, job.bytes, us(t0, t1), us(t1, t2), us(t2, t3), us(t3, t4), 0.0};
-      tail_.store(t + 1, std::memory_order_release);
+      if (failed) break;
+      if (moved) { last = clk::now(); continue; }
+      _mm_pause();
+      // a channel that has published and waits for the peer, or a posted big job whose card never signals, for longer
+      // than the timeout means the peer (or this card) is gone
+      const bool waiting = sst == 1 || bst == 1 || (bst == 0 && tail_.load() < head_.load());
+      if (waiting && std::chrono::duration<double>(clk::now() - last).count() > limit) {
+        if (status[8] == 0) status[8] = sst == 1 ? sn : -bj.seq;
+        break;
+      }
     }
   }
 
@@ -627,20 +643,24 @@ class Exchange {
   char* base_ = nullptr;
   size_t total_ = 0;
   bool direct_ = false;          // the section is imported for the copy engine: the big path skips the helper's memcpy
-  bool fused_ = false;           // small path in one kernel (export, wait, add); VLLM_XPU_EXCHANGE_FUSED=1
-  int64_t ahead_ = 1;            // all_reduces the Python thread may run ahead of the peer; VLLM_XPU_EXCHANGE_AHEAD
   Imported imported_;
+  int64_t ahead_ = 1;            // host calls this side may make ahead of the peer's; VLLM_XPU_EXCHANGE_AHEAD
   uint64_t* mine_[2] = {};       // host USM, tagged words (small path): my half, written by the export kernel, read by the helper
   uint64_t* theirs_[2] = {};     // host USM, tagged words (small path): the peer's half, written by the helper, read by the add kernel
-  char* mine_plain_[2] = {};     // host USM (big path): my half, written by the copy engine, read by the helper
-  char* theirs_plain_[2] = {};   // host USM (big path): the peer's half, written by the helper, read by the copy engine
+  char* mine_plain_[2] = {};     // host USM (big path, not direct): my half, written by the copy engine, read by the helper
+  char* theirs_plain_[2] = {};   // host USM (big path, not direct): the peer's half, written by the helper, read by the copy engine
   char* theirs_dev_[2] = {};     // card memory (big path): the peer's half, copied in, read by the add kernel
   int64_t* marker_mine_ = nullptr;   // host USM, 2 lines (big path): one-lane kernel -> helper, "the copy has finished"
   int64_t* marker_theirs_ = nullptr; // host USM, 2 lines (big path): helper -> one-lane kernel, "the peer's half is in place"
   int64_t* status_ = nullptr;    // host USM, 2 lines: [0] card gave up at seq, [8] helper gave up at seq
-  int64_t seq_ = 0;
-  int64_t n_small_ = 0, n_big_ = 0;
+  uint64_t* hdr_ = nullptr;      // host USM, HRING words (small path): card -> helper job headers (bytes, tag s)
+  int64_t* dseq_ = nullptr;      // card memory (small path): the last small sequence completed on this card
+  int64_t bseq_ = 0;             // host: big-path sequence
+  int64_t host_calls_ = 0;       // host: calls through run(), small and big, for the guard
+  int64_t n_small_ = 0, n_big_ = 0, n_recorded_ = 0;
   Stat stats_[STATS] = {};
+  std::atomic<int64_t> stat_count_{0};
+  std::atomic<int64_t> next_small_{1};
   std::thread helper_;
   Job ring_[RING];
   std::atomic<int64_t> head_{0}, tail_{0};
@@ -657,9 +677,10 @@ PYBIND11_MODULE(_xpu_exchange, m) {
            pybind11::arg("name"), pybind11::arg("slot_bytes"), pybind11::arg("device_index"))
       .def("all_reduce_", &Exchange::all_reduce_, pybind11::arg("tensor"), "all_reduce on the current XPU stream into a new tensor; returns at once")
       .def("try_all_reduce_", &Exchange::try_all_reduce_, pybind11::arg("tensor"), "as all_reduce_, but returns None (and does nothing) for a tensor the exchange cannot take")
-      .def("status", &Exchange::status, "(gpu_timeout_seq, helper_timeout_seq, sequence); zeros mean healthy")
+      .def("status", &Exchange::status, "(card_timeout_seq, helper_timeout_seq, host_calls); zeros mean healthy")
       .def("debug", &Exchange::debug, "one line with every flag and the last jobs, for the log when something fails")
       .def("stats", &Exchange::stats, pybind11::arg("n") = 16, "helper stage timings (us) for the last n jobs")
       .def("direct", &Exchange::direct, "True when the shared section is imported and the big path uses it with the copy engine")
+      .def("counts", &Exchange::counts, "(small host calls, small calls made while recording a graph, big host calls)")
       .def("close", &Exchange::close);
 }
