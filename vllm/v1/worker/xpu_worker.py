@@ -358,6 +358,13 @@ class XPUWorker(Worker):
         if self.use_v2_model_runner:
             logger.info_once("Using V2 Model Runner")
 
+        # VLLM_XPU_DETERMINISTIC=1: torch's deterministic algorithms (warn only where an op has none). A 28-layer step
+        # of norm + oneDNN matmuls differed from itself in the last bf16 bit in 6-8 runs of 100, eager or graph replay,
+        # and in 0 of 100 with this on (probe/graph-determinism, 2026-10-13 18:48): an order-dependent sum, not a race.
+        if os.environ.get("VLLM_XPU_DETERMINISTIC") == "1":
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            logger.info_once("Windows XPU: deterministic algorithms on (VLLM_XPU_DETERMINISTIC=1)")
+
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
