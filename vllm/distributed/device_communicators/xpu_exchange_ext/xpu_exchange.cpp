@@ -199,6 +199,7 @@ class Exchange {
     if (rank == 0) std::memset(base_, 0, HEADER);   // flags; the slots need no zeroing
     total_ = total;
     direct_ = import_for_copy_engine(base_, total, imported_);
+    { const char* f = std::getenv("VLLM_XPU_EXCHANGE_FUSED"); fused_ = f && std::string(f) == "1"; }
     sycl::context& ctx = c10::xpu::get_device_context();
     sycl::device& dev = c10::xpu::get_raw_device(device_index);
     for (int b = 0; b < 2; ++b) {
@@ -282,14 +283,33 @@ class Exchange {
       // has no barrier: the helper validates every word's tag. The 8-byte stores stay scalar: a 32-byte vector store
       // with the uncached hint ran ~80x slower (14.7 MB in 400 ms instead of 5 ms; 10:15).
       uint64_t* mine = mine_[b];
+      const uint64_t* theirs = theirs_[b];
+      int64_t* status = status_;
+      if (fused_) {
+        // One kernel per all_reduce (VLLM_XPU_EXCHANGE_FUSED=1, 2026-10-13), launched BEFORE the guard as the export
+        // was: every lane writes its tagged words, then waits for the peer's and adds. Saves one launch and one
+        // dispatch gap per exchange (Linux's oneCCL LL256 does it in one kernel: 13 us against our 28). All 512 lanes are
+        // one work-group, resident together, so every export is written before any lane can block on its poll. The
+        // earlier fused try (11:40, 2026-10-11) launched AFTER the guard and lost: the export waited on the host.
+        // MEASURED 2026-10-13: no gain (7 KB back to back 28.3 us fused vs 27.8 two kernels, both bit-exact), so the
+        // launch count is not the cost; the round trip through the two CPU helpers is. Kept off by default, for the
+        // record. probe/one-process-pingpong: two cards in ONE process polling one host buffer do 7 KB in 14.3 us one
+        // way, i.e. a helper-free exchange would match oneCCL's 13 us, but only with a single-process two-card executor.
+        switch (dt) {
+          case F32: fused_kernel<F32>(q, x, y, mine, theirs, status, seq, tag, nwords); break;
+          case BF16: fused_kernel<BF16>(q, x, y, mine, theirs, status, seq, tag, nwords); break;
+          default: fused_kernel<F16>(q, x, y, mine, theirs, status, seq, tag, nwords); break;
+        }
+        post(seq, bytes);
+        guard(seq);
+        return out;
+      }
       q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
         uncached_wptr<uint64_t> m{mine};
         for (size_t i = it.get_local_id(0); i < nwords; i += WG) m[i] = tagged(x[i], tag);
       });
       post(seq, bytes);
       guard(seq);
-      const uint64_t* theirs = theirs_[b];
-      int64_t* status = status_;
       switch (dt) {
         case F32: add_kernel<F32>(q, x, y, theirs, status, seq, tag, nwords); break;
         case BF16: add_kernel<BF16>(q, x, y, theirs, status, seq, tag, nwords); break;
@@ -451,6 +471,30 @@ class Exchange {
     });
   }
 
+  // small path, fused: export my tagged words, then wait for the peer's and add (one work-group, see run())
+  template <int DT>
+  static void fused_kernel(sycl::queue& q, const uint32_t* x, uint32_t* y, uint64_t* mine, const uint64_t* theirs,
+                           int64_t* status, int64_t seq, uint32_t tag, size_t nwords) {
+    const size_t nvec = nwords / 4;
+    q.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+      size_t lid = it.get_local_id(0);
+      {
+        uncached_wptr<uint64_t> m{mine};
+        for (size_t i = lid; i < nwords; i += WG) m[i] = tagged(x[i], tag);
+      }
+      for (size_t v = lid; v < nvec; v += WG) {
+        u64x4 w = wait_tagged4(theirs + 4 * v, tag, seq, status);
+        size_t i = 4 * v;
+        y[i] = add_words<DT>(x[i], data_of(w[0]));
+        y[i + 1] = add_words<DT>(x[i + 1], data_of(w[1]));
+        y[i + 2] = add_words<DT>(x[i + 2], data_of(w[2]));
+        y[i + 3] = add_words<DT>(x[i + 3], data_of(w[3]));
+      }
+      for (size_t i = 4 * nvec + lid; i < nwords; i += WG)
+        y[i] = add_words<DT>(x[i], data_of(wait_tagged(theirs + i, tag, seq, status)));
+    });
+  }
+
   void check_status() const {
     volatile int64_t* s = reinterpret_cast<volatile int64_t*>(status_);
     if (s[0] != 0) throw std::runtime_error("xpu exchange: the card waited too long for the peer's half at all_reduce #" + std::to_string(s[0]) + " (peer gone or stalled); results after that point are invalid");
@@ -575,6 +619,7 @@ class Exchange {
   char* base_ = nullptr;
   size_t total_ = 0;
   bool direct_ = false;          // the section is imported for the copy engine: the big path skips the helper's memcpy
+  bool fused_ = false;           // small path in one kernel (export, wait, add); VLLM_XPU_EXCHANGE_FUSED=1
   Imported imported_;
   uint64_t* mine_[2] = {};       // host USM, tagged words (small path): my half, written by the export kernel, read by the helper
   uint64_t* theirs_[2] = {};     // host USM, tagged words (small path): the peer's half, written by the helper, read by the add kernel
