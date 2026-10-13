@@ -200,6 +200,7 @@ class Exchange {
     total_ = total;
     direct_ = import_for_copy_engine(base_, total, imported_);
     { const char* f = std::getenv("VLLM_XPU_EXCHANGE_FUSED"); fused_ = f && std::string(f) == "1"; }
+    { const char* a = std::getenv("VLLM_XPU_EXCHANGE_AHEAD"); int k = a ? std::atoi(a) : 1; ahead_ = k < 1 ? 1 : (k > 64 ? 64 : k); }
     sycl::context& ctx = c10::xpu::get_device_context();
     sycl::device& dev = c10::xpu::get_raw_device(device_index);
     for (int b = 0; b < 2; ++b) {
@@ -442,11 +443,18 @@ class Exchange {
   // read of the shared flag). In lockstep this costs nothing; it keeps the Python thread at most one all_reduce ahead
   // of the slower card, so the GPU wait only ever covers one layer of peer work plus the hop, never a JIT compile or
   // a scheduler hiccup on the other side. A peer that is gone shows up here as a 60 s timeout.
+  //
+  // VLLM_XPU_EXCHANGE_AHEAD=K (2026-10-13, default 1 = the behaviour above): wait only for the peer's s-K, so the Python
+  // thread can queue up to K all_reduces (and the layers between them) ahead of the cards. Correctness does not depend
+  // on K: buffer reuse is ordered by the cards' in-order queues and the helper's in-order jobs (a card cannot export s+2
+  // before its add s+1 has seen the peer's s+1, which the peer's helper publishes only after it has read my slot for s).
+  // What K trades: a larger K hides the CPU's launch and Python time behind card work in two-card decode, but a peer
+  // that stalls (a JIT compile, a scheduler hiccup) then leaves more queued card work spinning toward SPIN_LIMIT.
   void guard(int64_t seq) {
-    if (seq <= 1) return;
+    if (seq <= ahead_) return;
     volatile int64_t* peer_flag = reinterpret_cast<volatile int64_t*>(base_ + FLAG_OFF[peer_]);
-    if (!wait_word(peer_flag, seq - 1, stop_))
-      throw std::runtime_error("xpu exchange: the peer never reached all_reduce #" + std::to_string(seq - 1) + " within " +
+    if (!wait_word(peer_flag, seq - ahead_, stop_))
+      throw std::runtime_error("xpu exchange: the peer never reached all_reduce #" + std::to_string(seq - ahead_) + " within " +
                                std::to_string((int)timeout_s()) + " s (peer gone or stalled; VLLM_XPU_EXCHANGE_TIMEOUT_S)");
   }
 
@@ -620,6 +628,7 @@ class Exchange {
   size_t total_ = 0;
   bool direct_ = false;          // the section is imported for the copy engine: the big path skips the helper's memcpy
   bool fused_ = false;           // small path in one kernel (export, wait, add); VLLM_XPU_EXCHANGE_FUSED=1
+  int64_t ahead_ = 1;            // all_reduces the Python thread may run ahead of the peer; VLLM_XPU_EXCHANGE_AHEAD
   Imported imported_;
   uint64_t* mine_[2] = {};       // host USM, tagged words (small path): my half, written by the export kernel, read by the helper
   uint64_t* theirs_[2] = {};     // host USM, tagged words (small path): the peer's half, written by the helper, read by the add kernel
