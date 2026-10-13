@@ -141,6 +141,47 @@ __attribute__((target("clflushopt"))) static void invalidate_lines(const void* p
   _mm_sfence();
 }
 
+// Direct big path (2026-10-13): import the shared section into this process's Level Zero driver(s) with
+// zexDriverImportExternalPointer, so the card's COPY ENGINE can read and write the section itself. Kernels still fault on
+// imported memory (probe/import-test, 2026-10-11), but the big path only ever touches it with copies. probe/section-copy
+// (two processes, one section, both cards): 14.7 MB all_reduce round 1,403 us, every sum bit-exact, against 4,204 us for
+// the helper-memcpy path and ~2,720 us for oneCCL on Linux; without the import the same copies run at half speed.
+// Returns the driver and release function on success; VLLM_XPU_EXCHANGE_DIRECT=0 turns it off.
+typedef struct _ze_driver_handle_t* ze_driver_handle_t;
+typedef uint32_t ze_result_t;
+typedef ze_result_t (*pfn_zeInit)(uint32_t);
+typedef ze_result_t (*pfn_zeDriverGet)(uint32_t*, ze_driver_handle_t*);
+typedef ze_result_t (*pfn_zeDriverGetExtensionFunctionAddress)(ze_driver_handle_t, const char*, void**);
+typedef ze_result_t (*pfn_zexDriverImportExternalPointer)(ze_driver_handle_t, void*, size_t);
+typedef ze_result_t (*pfn_zexDriverReleaseImportedPointer)(ze_driver_handle_t, void*);
+struct Imported { std::vector<std::pair<ze_driver_handle_t, pfn_zexDriverReleaseImportedPointer>> drivers; };
+static bool import_for_copy_engine(void* p, size_t bytes, Imported& out) {
+  const char* e = std::getenv("VLLM_XPU_EXCHANGE_DIRECT");
+  if (e && std::string(e) == "0") return false;
+  HMODULE lib = LoadLibraryA("ze_loader.dll");
+  if (!lib) return false;
+  auto zeInit = (pfn_zeInit)GetProcAddress(lib, "zeInit");
+  auto zeDriverGet = (pfn_zeDriverGet)GetProcAddress(lib, "zeDriverGet");
+  auto getExt = (pfn_zeDriverGetExtensionFunctionAddress)GetProcAddress(lib, "zeDriverGetExtensionFunctionAddress");
+  if (!zeInit || !zeDriverGet || !getExt) return false;
+  zeInit(0);
+  uint32_t n = 0;
+  if (zeDriverGet(&n, nullptr) != 0 || n == 0) return false;
+  std::vector<ze_driver_handle_t> drivers(n);
+  zeDriverGet(&n, drivers.data());
+  // the loader lists every Level Zero driver (the NPU has one too): import into each that offers the extension, as the
+  // probe did, so the GPU's driver is certainly among them
+  for (uint32_t d = 0; d < n; ++d) {
+    void* fi = nullptr; void* fr = nullptr;
+    getExt(drivers[d], "zexDriverImportExternalPointer", &fi);
+    getExt(drivers[d], "zexDriverReleaseImportedPointer", &fr);
+    if (!fi) continue;
+    if (((pfn_zexDriverImportExternalPointer)fi)(drivers[d], p, bytes) == 0)
+      out.drivers.emplace_back(drivers[d], (pfn_zexDriverReleaseImportedPointer)fr);
+  }
+  return !out.drivers.empty();
+}
+
 class Exchange {
  public:
   Exchange(int rank, int world_size, const std::string& name, size_t slot_bytes, int device_index)
@@ -156,22 +197,27 @@ class Exchange {
     base_ = reinterpret_cast<char*>(MapViewOfFile(hmap_, FILE_MAP_ALL_ACCESS, 0, 0, total));
     if (!base_) throw std::runtime_error("xpu exchange: MapViewOfFile failed, error " + std::to_string(GetLastError()));
     if (rank == 0) std::memset(base_, 0, HEADER);   // flags; the slots need no zeroing
+    total_ = total;
+    direct_ = import_for_copy_engine(base_, total, imported_);
     sycl::context& ctx = c10::xpu::get_device_context();
     sycl::device& dev = c10::xpu::get_raw_device(device_index);
     for (int b = 0; b < 2; ++b) {
       // small path: tagged words, 8 bytes per data word, up to SMALL data bytes
       mine_[b] = static_cast<uint64_t*>(sycl::malloc_host(2 * SMALL, ctx));
       theirs_[b] = static_cast<uint64_t*>(sycl::malloc_host(2 * SMALL, ctx));
-      // big path: plain bytes moved by the copy engine, a tagged marker word for the handover
-      mine_plain_[b] = static_cast<char*>(sycl::malloc_host(slot_bytes, ctx));
-      theirs_plain_[b] = static_cast<char*>(sycl::malloc_host(slot_bytes, ctx));
+      // big path: plain bytes moved by the copy engine, a tagged marker word for the handover; with the section
+      // imported (direct_) the copy engine uses the shared slots themselves and no private staging is needed
+      if (!direct_) {
+        mine_plain_[b] = static_cast<char*>(sycl::malloc_host(slot_bytes, ctx));
+        theirs_plain_[b] = static_cast<char*>(sycl::malloc_host(slot_bytes, ctx));
+      }
       theirs_dev_[b] = static_cast<char*>(sycl::malloc_device(slot_bytes, dev, ctx));
     }
     status_ = static_cast<int64_t*>(sycl::malloc_host(2 * 64, ctx));
     marker_mine_ = static_cast<int64_t*>(sycl::malloc_host(2 * 64, ctx));
     marker_theirs_ = static_cast<int64_t*>(sycl::malloc_host(2 * 64, ctx));
     for (int b = 0; b < 2; ++b)
-      if (!mine_[b] || !theirs_[b] || !mine_plain_[b] || !theirs_plain_[b] || !theirs_dev_[b])
+      if (!mine_[b] || !theirs_[b] || (!direct_ && (!mine_plain_[b] || !theirs_plain_[b])) || !theirs_dev_[b])
         throw std::runtime_error("xpu exchange: USM allocation failed");
     if (!status_ || !marker_mine_ || !marker_theirs_) throw std::runtime_error("xpu exchange: USM allocation failed");
     for (int b = 0; b < 2; ++b) { std::memset(mine_[b], 0, 2 * SMALL); std::memset(theirs_[b], 0, 2 * SMALL); }
@@ -254,7 +300,8 @@ class Exchange {
       // Big path (prefill chunks, MBs): the copy engine moves the bytes into pinned host memory at PCIe speed, then a
       // one-lane kernel, which the in-order queue starts only after the copy has completed, stores the sequence into
       // the marker line. Tagging every word of a 14.7 MB tensor with 8-byte stores took ~8 ms; this takes ~1.5.
-      q.memcpy(mine_plain_[b], x, bytes);
+      // direct_: straight into my slot of the shared section (imported for the copy engine), no helper memcpy later
+      q.memcpy(direct_ ? slot(rank_, b) : mine_plain_[b], x, bytes);
       int64_t* marker = marker_mine_ + b * 8;
       q.single_task([=]() { uncached_wptr<int64_t> m{marker}; m[0] = seq; });
     }
@@ -276,7 +323,10 @@ class Exchange {
           if (++polls > SPIN_LIMIT) { uncached_wptr<int64_t> s{status}; if (s[0] == 0) s[0] = seq; break; }
         }
       });
-      q.memcpy(theirs_dev_[b], theirs_plain_[b], bytes);
+      // direct_: straight out of the peer's slot. Reuse is safe: my copy into slot b at s+2 runs after my poll at s+1,
+      // which needs the peer's flag s+1, which the peer publishes only after its card has read my slot b at s (its queue
+      // is in order: copy-out s, add s, copy-in s+1, marker s+1).
+      q.memcpy(theirs_dev_[b], direct_ ? slot(peer_, b) : theirs_plain_[b], bytes);
       const uint32_t* theirs = reinterpret_cast<const uint32_t*>(theirs_dev_[b]);
       switch (dt) {
         case F32: q.parallel_for(sycl::range<1>(nwords), [=](sycl::id<1> i) { y[i] = add_words<F32>(x[i], theirs[i]); }); break;
@@ -288,6 +338,7 @@ class Exchange {
   }
 
  public:
+  bool direct() const { return direct_; }
   // (gpu_timeout_seq, helper_timeout_seq, sequence): zero means no failure so far
   std::tuple<int64_t, int64_t, int64_t> status() const {
     return {reinterpret_cast<volatile int64_t*>(status_)[0], reinterpret_cast<volatile int64_t*>(status_)[8], seq_};
@@ -360,6 +411,8 @@ class Exchange {
     if (status_) sycl::free(status_, ctx);
     if (marker_mine_) sycl::free(marker_mine_, ctx);
     if (marker_theirs_) sycl::free(marker_theirs_, ctx);
+    for (auto& d : imported_.drivers) if (d.second && base_) d.second(d.first, base_);
+    imported_.drivers.clear();
     if (base_) UnmapViewOfFile(base_);
     if (hmap_) CloseHandle(hmap_);
   }
@@ -479,9 +532,11 @@ class Exchange {
         if (!wait_word(reinterpret_cast<volatile int64_t*>(marker_mine_) + b * 8, job.seq, stop_, /*card_written=*/true)) {
           if (!stop_) status[8] = job.seq; tail_.store(t + 1); continue;
         }
-        invalidate_lines(mine_plain_[b], job.bytes);
-        _mm_mfence();
-        std::memcpy(slot(rank_, b), mine_plain_[b], job.bytes);
+        if (!direct_) {
+          invalidate_lines(mine_plain_[b], job.bytes);
+          _mm_mfence();
+          std::memcpy(slot(rank_, b), mine_plain_[b], job.bytes);
+        }
       }
       auto t1 = clk::now();
       MemoryBarrier();
@@ -499,8 +554,10 @@ class Exchange {
         invalidate_lines(out, nwords * sizeof(uint64_t));
         _mm_mfence();
       } else {
-        std::memcpy(theirs_plain_[b], slot(peer_, b), job.bytes);
-        invalidate_lines(theirs_plain_[b], job.bytes);
+        if (!direct_) {
+          std::memcpy(theirs_plain_[b], slot(peer_, b), job.bytes);
+          invalidate_lines(theirs_plain_[b], job.bytes);
+        }
         _mm_mfence();
         reinterpret_cast<volatile int64_t*>(marker_theirs_)[b * 8] = job.seq;   // the card's one-lane kernel polls this
         _mm_mfence();
@@ -516,6 +573,9 @@ class Exchange {
   int device_index_;
   HANDLE hmap_ = NULL;
   char* base_ = nullptr;
+  size_t total_ = 0;
+  bool direct_ = false;          // the section is imported for the copy engine: the big path skips the helper's memcpy
+  Imported imported_;
   uint64_t* mine_[2] = {};       // host USM, tagged words (small path): my half, written by the export kernel, read by the helper
   uint64_t* theirs_[2] = {};     // host USM, tagged words (small path): the peer's half, written by the helper, read by the add kernel
   char* mine_plain_[2] = {};     // host USM (big path): my half, written by the copy engine, read by the helper
@@ -546,5 +606,6 @@ PYBIND11_MODULE(_xpu_exchange, m) {
       .def("status", &Exchange::status, "(gpu_timeout_seq, helper_timeout_seq, sequence); zeros mean healthy")
       .def("debug", &Exchange::debug, "one line with every flag and the last jobs, for the log when something fails")
       .def("stats", &Exchange::stats, pybind11::arg("n") = 16, "helper stage timings (us) for the last n jobs")
+      .def("direct", &Exchange::direct, "True when the shared section is imported and the big path uses it with the copy engine")
       .def("close", &Exchange::close);
 }
