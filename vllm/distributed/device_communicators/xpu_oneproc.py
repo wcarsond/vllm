@@ -63,6 +63,8 @@ SWAP = [
     ("vllm.compilation.monitor", "cudagraph_capturing_enabled"),
     ("vllm.compilation.backends", "model_tag"),
     ("vllm.compilation.backends", "model_is_encoder"),
+    # the XPU kernels' FP4 lookup table, cached on the first card that asks (2026-10-13, found looking at gpt-oss)
+    ("vllm_xpu_kernels.moe_utils", "_FP4_E2M1_LUT_XPU"),
 ]
 # Module-level caches of objects that hold card tensors, keyed by something other than the card: each rank starts from
 # an EMPTY one of its own. 2026-10-13 17:30: _ROPE_DICT handed rank 1 rank 0's rotary embedding, whose cos/sin table

@@ -42,6 +42,22 @@ logger = init_logger(__name__)
 _SURVIVOR_GRACE_S = 60.0
 
 
+# VLLM_XPU_ONEPROC_TIMING=1 (2026-10-13): each rank's own time inside every RPC (baton waits taken out), printed per
+# method every 500 calls - how much host work the two ranks do in turn. Measured around the whole task, never by waiting
+# on a card (a timer that synchronized a card inside a step broke the lockstep and stalled the run, 18:20).
+_TIMING = os.environ.get("VLLM_XPU_ONEPROC_TIMING") == "1"
+_timing: dict = {}
+
+
+def _timing_add(rank: int, label: str, seconds: float) -> None:
+    t = _timing.setdefault((label, rank), [0.0, 0])
+    t[0] += seconds
+    t[1] += 1
+    if t[1] % 500 == 0:
+        print(f"[oneproc timing] {label} rank {rank}: {1e3 * t[0] / t[1]:.2f} ms host per call over {t[1]} calls",
+              flush=True)
+
+
 class _RankThread(threading.Thread):
     def __init__(self, rank: int):
         super().__init__(name=f"oneproc-rank{rank}", daemon=True)
@@ -57,16 +73,19 @@ class _RankThread(threading.Thread):
             task = self.tasks.get()
             if task is None:
                 return
-            fn, done = task
+            fn, done, label = task
             self.busy = True
             baton.acquire(self.rank)
             result, err = None, None
+            t0, w0 = time.perf_counter(), baton.wait_s[self.rank]
             try:
                 result = fn()   # an AsyncModelRunnerOutput stays unresolved: see collective_rpc
             except BaseException as e:  # noqa: BLE001
                 err = e
                 logger.error("one-process rank %d failed:\n%s", self.rank, traceback.format_exc())
             finally:
+                if _TIMING and label:
+                    _timing_add(self.rank, label, time.perf_counter() - t0 - (baton.wait_s[self.rank] - w0))
                 baton.finish(self.rank)
                 self.busy = False
             done(self.rank, result, err)
@@ -120,7 +139,7 @@ class OneProcExecutor(Executor):
         logger.info("one-process executor: model loaded on both cards (%.1f s)", time.time() - t0)
 
     # ---- running work on both rank threads
-    def _run_each(self, fns: list[Callable[[], Any]]) -> list[Any]:
+    def _run_each(self, fns: list[Callable[[], Any]], label: str = "") -> list[Any]:
         """fns[r] on rank r's thread, rank 0 starting with the baton; both results, or the first error raised."""
         results: list[Any] = [None, None]
         errors: list[BaseException | None] = [None, None]
@@ -136,7 +155,7 @@ class OneProcExecutor(Executor):
 
         xpu_oneproc.baton().begin([0, 1])
         for r in range(2):
-            self.threads[r].tasks.put((fns[r], done))
+            self.threads[r].tasks.put((fns[r], done, label))
         with cv:
             while done_count[0] < 2:
                 cv.wait(timeout=1.0)
@@ -151,8 +170,8 @@ class OneProcExecutor(Executor):
             raise RuntimeError("one-process executor: a rank never finished")
         return results
 
-    def _run_all(self, fn: Callable[[WorkerWrapperBase], Any]) -> list[Any]:
-        return self._run_each([lambda r=r: fn(self.workers[r]) for r in range(2)])
+    def _run_all(self, fn: Callable[[WorkerWrapperBase], Any], label: str = "") -> list[Any]:
+        return self._run_each([lambda r=r: fn(self.workers[r]) for r in range(2)], label)
 
     def collective_rpc(  # type: ignore[override]
         self,
@@ -167,7 +186,8 @@ class OneProcExecutor(Executor):
     ) -> Any:
         kwargs = kwargs or {}
         try:
-            results = self._run_all(lambda w: run_method(w, method, args, kwargs))
+            results = self._run_all(lambda w: run_method(w, method, args, kwargs),
+                                    method if isinstance(method, str) else "")
         except BaseException as e:  # noqa: BLE001
             if not non_block:
                 raise
