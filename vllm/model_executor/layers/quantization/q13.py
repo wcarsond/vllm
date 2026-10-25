@@ -7,6 +7,23 @@ Each weight is stored as three fixed-width planes - a sign+mantissa byte, a
 so this is a quantization method with zero quantization error: ~19% of weight
 VRAM back, outputs identical to running unquantized.
 
+Why this works, conceptually: a bf16 weight spends 8 bits on its exponent,
+but trained weights live in a narrow band of magnitudes. Take any
+million-element chunk and the spread between its biggest and tiniest values
+covers a few dozen powers of two at most (measured here: 14-29 distinct
+exponents per chunk, never more than 32). Bounding that band per chunk turns
+the 8-bit exponent into a 5-bit LUT index. The mantissa is the opposite
+case: it is statistically near-random - that is what "precision" is - so it
+is kept raw. Sign 1 + mantissa 7 + exponent index 5 = 13 bits.
+
+Why 13 bits and not the ~10.6-bit entropy floor: runtime. An entropy coder
+(rANS) reaches the floor but decodes sequentially and gives up random
+access; fixed-width planes decode with shifts and masks at memory speed,
+inside whatever kernel needs the weight. The last ~2.5 bits are deliberately
+left on the table in exchange for a decode that never becomes the
+bottleneck. And it is lossless because the contract is precision first:
+speed is only taken where it costs nothing.
+
 Measured on two Arc Pro B60s on Windows 11: whole-model packing of Qwen3-1.7B
 lands at r = 0.8125 exactly (2051 chunks, zero fallbacks, every tensor
 round-tripped bit-exact); the offline smoke is greedy token-identical to bf16,
