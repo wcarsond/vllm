@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Q13: lossless 13-bit resident storage for bf16 linear weights.
+
+Each weight is stored as three fixed-width planes - a sign+mantissa byte, a
+4-bit exponent-LUT index nibble, and a 1-bit high-index bitmap - with one
+32-entry exponent LUT per 1M-element chunk. Reconstruction is bit-exact bf16
+(see CODEC-NOTES.md at the repo root: whole-model r = 0.8125, EXACT), so this
+is a quantization method with zero quantization error: ~19% of weight VRAM
+back, outputs identical to running unquantized.
+
+v1 applies via unpack-to-scratch + the stock unquantized GEMM (correctness
+first; the fused Triton GEMV/GEMM from server/ is the speed lap). Enable with
+quantization="q13" after importing this module; registration is via the
+decorator, no core files are touched.
+"""
+
+import torch
+
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.layers.quantization import (
+    register_quantization_config,
+)
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+
+CHUNK = 1 << 20  # elements per exponent-LUT chunk (multiple of 8)
+
+
+def _pack_q13(w: torch.Tensor):
+    """bf16 tensor -> (sm u8, nib u8, hi u8, luts i32 (n_chunks,32), n, shape).
+
+    Bit-exact: unpack reproduces w's bf16 bit pattern exactly.
+    """
+    assert w.dtype == torch.bfloat16
+    shape = w.shape
+    u = w.reshape(-1).view(torch.int16).to(torch.int32) & 0xFFFF
+    n = u.numel()
+    pad = (-n) % 8
+    if pad:
+        u = torch.nn.functional.pad(u, (0, pad))
+    exp = (u >> 7) & 0xFF
+    sm = ((((u >> 15) & 1) << 7) | (u & 0x7F)).to(torch.uint8)
+    idx = torch.empty_like(exp)
+    luts = []
+    for s in range(0, u.numel(), CHUNK):
+        e = exp[s : s + CHUNK]
+        uniq = torch.unique(e)
+        if uniq.numel() > 32:
+            raise ValueError("Q13: exponent band %d > 32 in chunk" % uniq.numel())
+        lut = torch.zeros(32, dtype=torch.int32, device=u.device)
+        lut[: uniq.numel()] = uniq
+        inv = torch.zeros(256, dtype=torch.int32, device=u.device)
+        inv[uniq.long()] = torch.arange(
+            uniq.numel(), dtype=torch.int32, device=u.device
+        )
+        idx[s : s + CHUNK] = inv[e.long()]
+        luts.append(lut)
+    nib = ((idx[0::2] & 0xF) | ((idx[1::2] & 0xF) << 4)).to(torch.uint8)
+    bits = (idx >> 4).reshape(-1, 8).to(torch.uint8)
+    weights8 = (
+        torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8, device=u.device)
+    )
+    hi = (bits * weights8).sum(dim=1, dtype=torch.int32).to(torch.uint8)
+    return sm, nib, hi, torch.stack(luts), n, shape
+
+
+def _unpack_q13(sm, nib, hi, luts, n, shape):
+    """Planes -> bf16 tensor, bit-exact."""
+    total = sm.numel()
+    idx = torch.empty(total, dtype=torch.int32, device=sm.device)
+    nib32 = nib.to(torch.int32)
+    idx[0::2] = nib32 & 0xF
+    idx[1::2] = nib32 >> 4
+    hb = hi.to(torch.int32)
+    bit = (
+        (hb.unsqueeze(1) >> torch.arange(8, dtype=torch.int32, device=sm.device)) & 1
+    ).reshape(-1)
+    idx = idx | (bit << 4)
+    chunk_id = (
+        torch.arange(total, dtype=torch.int64, device=sm.device) // CHUNK
+    )
+    exp = luts[chunk_id, idx.long()]
+    sm32 = sm.to(torch.int32)
+    u = ((sm32 >> 7) << 15) | (exp << 7) | (sm32 & 0x7F)
+    w = u.to(torch.int16).view(torch.bfloat16)
+    return w[:n].reshape(shape)
+
+
+class Q13LinearMethod(UnquantizedLinearMethod):
+    """Unquantized create_weights/loading; packs after load, unpacks in apply."""
+
+    packed_layers = 0
+    packed_bytes_saved = 0
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        w = layer.weight.data
+        if w.dtype != torch.bfloat16:
+            return  # leave non-bf16 layers untouched
+        sm, nib, hi, luts, n, shape = _pack_q13(w)
+        Q13LinearMethod.packed_layers += 1
+        Q13LinearMethod.packed_bytes_saved += n * 2 - (
+            sm.numel() + nib.numel() + hi.numel() + luts.numel() * 4
+        )
+        if Q13LinearMethod.packed_layers == 1:
+            print("Q13: packing engaged (first linear layer packed)", flush=True)
+        del layer._parameters["weight"]
+        layer.register_buffer("q13_sm", sm, persistent=False)
+        layer.register_buffer("q13_nib", nib, persistent=False)
+        layer.register_buffer("q13_hi", hi, persistent=False)
+        layer.register_buffer("q13_luts", luts, persistent=False)
+        layer.q13_n = n
+        layer.q13_shape = shape
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not hasattr(layer, "q13_sm"):  # non-bf16 layer: stock path
+            return super().apply(layer, x, bias)
+        w = _unpack_q13(
+            layer.q13_sm, layer.q13_nib, layer.q13_hi,
+            layer.q13_luts, layer.q13_n, layer.q13_shape,
+        )
+        return self._gemm_impl(layer, x, w, bias)
+
+
+@register_quantization_config("q13")
+class Q13Config(QuantizationConfig):
+    """Lossless 13-bit resident bf16 (CLI-only; no checkpoint config)."""
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "q13"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.bfloat16]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 0
+
+    @staticmethod
+    def get_config_filenames() -> list[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config) -> "Q13Config":
+        return cls()
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, LinearBase):
+            return Q13LinearMethod()
+        return None
