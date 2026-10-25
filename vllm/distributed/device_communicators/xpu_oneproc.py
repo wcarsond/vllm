@@ -241,6 +241,78 @@ def blocking_wait():
         yield
 
 
+# VLLM_XPU_EXCHANGE_PACK=1: compress large all_reduce payloads for transit.
+# Each value's exponent is replaced by a 4-bit index into a per-payload LUT
+# of its 16 most frequent exponents (measured on real prefill payloads: the
+# top 16 cover 99.97%); the rare rest travel as exact (position, value)
+# exceptions. ~12.01 bits per 16-bit value on the wire, r ~ 0.751. Each rank
+# sends packed, unpacks the PEER's half bit-exact, and adds it to its own
+# raw tensor - same values, same single addition, so the result is bitwise
+# identical to the raw exchange. Pays where the link is slow (the stages are
+# torch elementwise ops); on a fast link it is roughly a wash.
+_PACK = os.environ.get("VLLM_XPU_EXCHANGE_PACK", "0") == "1"
+_PACK_MIN = int(os.environ.get("VLLM_XPU_EXCHANGE_PACK_MIN_MB", "1")) << 20
+
+
+def _packed_all_reduce(t):
+    import torch
+
+    n = t.numel()
+    flat = t.reshape(-1)
+    u = flat.view(torch.int16).to(torch.int32) & 0xFFFF
+    exp = ((u >> 7) & 0xFF).long()
+    cnt = torch.zeros(256, dtype=torch.int32, device=t.device)
+    cnt.scatter_add_(0, exp, torch.ones_like(exp, dtype=torch.int32))
+    top = cnt.sort(descending=True).indices[:16]
+    inv = torch.full((256,), -1, dtype=torch.int32, device=t.device)
+    inv[top] = torch.arange(16, dtype=torch.int32, device=t.device)
+    idx = inv[exp]
+    exc_pos = torch.nonzero(idx < 0, as_tuple=False).reshape(-1).to(torch.int32)
+    cap = max(1024, n >> 9)  # 0.2%; measured payloads run ~0.03%
+    if exc_pos.numel() > cap or n % 2:
+        return None  # caller falls back to the raw exchange
+    exc_val = flat.view(torch.int16)[exc_pos.long()]
+    idx = idx.clamp_min_(0)
+    sm = ((((u >> 15) & 1) << 7) | (u & 0x7F)).to(torch.uint8)
+    nib = ((idx[0::2] & 0xF) | ((idx[1::2] & 0xF) << 4)).to(torch.uint8)
+    # fixed-capacity wire buffer (both ranks must send equal sizes):
+    # [sm n][nib n/2][lut 16*i16][n_exc i32][exc_pos cap*i32][exc_val cap*i16]
+    lut16 = top.to(torch.int16)
+    cap_bytes = n + n // 2 + 32 + 4 + cap * 4 + cap * 2
+    cap_bytes = (cap_bytes + 3) & ~3  # int32-aligned wire size
+    buf = torch.empty(cap_bytes, dtype=torch.uint8, device=t.device)
+    o = 0
+    buf[o:o + n] = sm; o += n
+    buf[o:o + n // 2] = nib; o += n // 2
+    buf[o:o + 32] = lut16.view(torch.uint8); o += 32
+    ne = exc_pos.numel()
+    buf[o:o + 4] = torch.tensor([ne], dtype=torch.int32,
+                                device=t.device).view(torch.uint8); o += 4
+    if ne:
+        buf[o:o + ne * 4] = exc_pos.view(torch.uint8)
+        buf[o + cap * 4:o + cap * 4 + ne * 2] = exc_val.view(torch.uint8)
+    # travel as int32: the slot splitter's step and every view stay aligned
+    both = exchange(buf.view(torch.int32), 1).view(torch.uint8)
+    r = current_rank()
+    peer = both[cap_bytes:] if r == 0 else both[:cap_bytes]
+    o = 0
+    psm = peer[o:o + n].to(torch.int32); o += n
+    pnib = peer[o:o + n // 2].to(torch.int32); o += n // 2
+    plut = peer[o:o + 32].clone().view(torch.int16).to(torch.int32); o += 32
+    pne = int(peer[o:o + 4].clone().view(torch.int32).item()); o += 4
+    pidx = torch.empty(n, dtype=torch.int32, device=t.device)
+    pidx[0::2] = pnib & 0xF
+    pidx[1::2] = pnib >> 4
+    pe = plut[pidx.long()] & 0xFF
+    pu = ((psm >> 7) << 15) | (pe << 7) | (psm & 0x7F)
+    if pne:
+        ppos = peer[o:o + pne * 4].clone().view(torch.int32).long()
+        pval = peer[o + cap * 4:o + cap * 4 + pne * 2].clone().view(torch.int16)
+        pu[ppos] = pval.to(torch.int32) & 0xFFFF
+    peer_t = pu.to(torch.int16).view(t.dtype).reshape(t.shape)
+    return t + peer_t
+
+
 def exchange(t, mode: int):
     """all_reduce (mode 0) or flattened all_gather (mode 1) of `t` with the other card's tensor of the same call.
 
@@ -250,6 +322,14 @@ def exchange(t, mode: int):
     capture; the replays are queued back to back)."""
     p = pair()
     nbytes = t.numel() * t.element_size()
+    import torch as _torch
+
+    if (_PACK and mode == 0 and t.dtype == _torch.bfloat16
+            and nbytes >= _PACK_MIN and current_rank() is not None
+            and BATON is not None and not _capturing()):
+        out = _packed_all_reduce(t.contiguous())
+        if out is not None:  # None = exception overflow; raw path below
+            return out
     if nbytes > _SLOT_BYTES:
         # larger than a slot (2026-10-13 17:16: the logits gather of memory profiling, 256 sequences x half the
         # vocabulary = 38.9 MB): in slot-size pieces, the same pieces on both ranks
