@@ -401,32 +401,32 @@ def _pack_q12(w: torch.Tensor):
     pad = (-n) % 32
     if pad:
         u = torch.nn.functional.pad(u, (0, pad))
-    exp = (u >> 7) & 0xFF
     sm = ((((u >> 15) & 1) << 7) | (u & 0x7F)).to(torch.uint8)
-    idx = torch.empty_like(exp)
-    luts = []
-    exc_gpos = []
-    for s in range(0, u.numel(), CHUNK):
-        e = exp[s : s + CHUNK]
-        counts = torch.bincount(e, minlength=256)
-        top = counts.sort(descending=True).indices[:16].to(torch.int32)
-        lut = torch.zeros(16, dtype=torch.int32, device=u.device)
-        lut[: top.numel()] = top
-        inv = torch.full((256,), -1, dtype=torch.int32, device=u.device)
-        inv[top.long()] = torch.arange(top.numel(), dtype=torch.int32, device=u.device)
-        ix = inv[e.long()]
-        exc = torch.nonzero(ix < 0).reshape(-1)
-        if exc.numel():
-            exc_gpos.append(exc + s)
-            ix[exc] = 0  # main plane uses lut[0]; the side list carries truth
-        idx[s : s + CHUNK] = ix
-        luts.append(lut)
+    # fully batched per-chunk pack: chunks are independent, so histograms,
+    # LUT ranking and index maps run as single batched ops instead of a
+    # python loop (the loop packed a 7B in ~90 s on CPU; this is seconds).
+    # Plane sizes keep the %32 padding; only the histogram view is
+    # chunk-padded, transiently.
+    dev = u.device
+    L = u.numel()
+    n_chunks = (L + CHUNK - 1) // CHUNK
+    total = n_chunks * CHUNK
+    ehist = u if total == L else torch.nn.functional.pad(u, (0, total - L))
+    exp2d = ((ehist >> 7) & 0xFF).reshape(n_chunks, CHUNK).long()
+    valid = (torch.arange(total, device=dev) < n).reshape(n_chunks, CHUNK)
+    counts = torch.zeros(n_chunks, 256, dtype=torch.int32, device=dev)
+    counts.scatter_add_(1, exp2d, valid.to(torch.int32))
+    top = counts.argsort(dim=1, descending=True)[:, :16].contiguous()
+    inv = torch.full((n_chunks, 256), -1, dtype=torch.int32, device=dev)
+    inv.scatter_(1, top, torch.arange(16, dtype=torch.int32, device=dev)
+                 .expand(n_chunks, 16).contiguous())
+    idx = inv.gather(1, exp2d).reshape(-1)[:L]
+    excmask = (idx < 0) & (torch.arange(L, device=dev) < n)
+    gpos = torch.nonzero(excmask).reshape(-1).to(torch.int64)
+    idx = idx.clamp_min(0)
     nib = ((idx[0::2] & 0xF) | ((idx[1::2] & 0xF) << 4)).to(torch.uint8)
-    gpos = (torch.cat(exc_gpos) if exc_gpos
-            else torch.empty(0, dtype=torch.int64, device=u.device)).to(torch.int64)
-    gpos = gpos[gpos < n]  # padding positions carry no truth
     exc_val = u[gpos].to(torch.int16)
-    return sm, nib, torch.stack(luts), gpos, exc_val, n, shape
+    return sm, nib, top.to(torch.int32), gpos, exc_val, n, shape
 
 
 def _unpack_q12(sm, nib, luts, exc_gpos, exc_val, n, shape):
