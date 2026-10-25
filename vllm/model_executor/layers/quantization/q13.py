@@ -619,7 +619,8 @@ class Q13LinearMethod(UnquantizedLinearMethod):
                 _gemm_q12_sb[(M, (B + 3) // 4)](*args, xs, y, B, M,
                                                 K=K, BK=BKv, BN=4,
                                                 CHUNK_SHIFT=CHUNK_SHIFT,
-                                                EXC_CAP=64, num_warps=2)
+                                                EXC_CAP=64, num_warps=1,
+                                                warp_size=16)
             else:
                 _gemm_q12[(M, (B + 31) // 32)](*args, xs, y, B, M,
                                                K=K, BK=128, BN=32,
@@ -635,7 +636,7 @@ class Q13LinearMethod(UnquantizedLinearMethod):
             _gemm_q13_sb[(M, (B + 3) // 4)](
                 layer.q13_sm32, layer.q13_nib32, layer.q13_hi32,
                 layer.q13_lutflat, xs, y, B, M,
-                K=K, BK=BKv, BN=4, CHUNK_SHIFT=CHUNK_SHIFT, num_warps=2)
+                K=K, BK=BKv, BN=4, CHUNK_SHIFT=CHUNK_SHIFT, num_warps=1, warp_size=16)
         else:
             _gemm_q13[(M, (B + 31) // 32)](
                 layer.q13_sm32, layer.q13_nib32, layer.q13_hi32,
