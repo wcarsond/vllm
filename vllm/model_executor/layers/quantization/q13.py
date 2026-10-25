@@ -26,12 +26,19 @@ speed is only taken where it costs nothing.
 
 Measured on two Arc Pro B60s on Windows 11: whole-model packing of Qwen3-1.7B
 lands at r = 0.8125 exactly (2051 chunks, zero fallbacks, every tensor
-round-tripped bit-exact); the offline smoke is greedy token-identical to bf16,
-with model memory 0.93 -> 0.81 GiB on a 0.5B. The fused apply reads the
-planes directly inside the matmul (the expanded weight never touches memory);
-set VLLM_Q13_FUSED=0 to fall back to unpack + the stock unquantized GEMM.
-Enable with quantization="q13" after importing this module; registration is
-via the decorator, no core files are touched.
+round-tripped bit-exact). On Qwen2.5-Coder-7B (bf16, one B60), the fused
+apply reads the planes directly inside the matmul (the expanded weight never
+touches memory): batch-1 decode 29.5 vs 30.0 tok/s unquantized (0.98x), KV
+cache 5.19 -> 7.26 GiB (+40% context), generated text identical. The fused
+matmul accumulates in fp32 and rounds to bf16, so outputs sit within one bf16
+ulp of the stock GEMM rather than bitwise equal; VLLM_Q13_FUSED=0 selects the
+bit-exact unpack reference path (token-identical to unquantized, much
+slower). Known gap: batched decode (2-31 concurrent sequences) runs ~0.4x
+unquantized - the per-element plane unpack saturates the vector ALUs
+alongside one batch column but not several, and the XMX units cannot be fed
+from registers. Single-stream serving is the design point. Enable with
+quantization="q13" after importing this module; registration is via the
+decorator, no core files are touched.
 """
 
 import os
@@ -55,15 +62,31 @@ logger = init_logger(__name__)
 
 CHUNK = 1 << 20          # elements per exponent-LUT chunk (multiple of 32)
 CHUNK_SHIFT = 20
-# The fused kernels pass standalone tests (within fp32 reassociation of
-# F.linear on real weights, all shapes) but the in-engine wiring is not yet
-# validated, so fused apply is OPT-IN experimental: VLLM_Q13_FUSED=1.
-# Default path: unpack + the stock unquantized GEMM (token-identical to bf16).
-_FUSED = os.environ.get("VLLM_Q13_FUSED", "0") == "1"
+# Fused apply is the default: validated in-engine per-call against the unpack
+# reference on every layer shape (max one bf16 output ulp apart; see
+# VLLM_Q13_CHECK) and greedy outputs matched bf16 on 0.5B and 7B smokes.
+# VLLM_Q13_FUSED=0 falls back to unpack + the stock GEMM: bit-exact bf16
+# matmul inputs (token-identical to unquantized), but it reconstructs every
+# weight tensor each step, ~10-25x slower - a reference path, not a mode.
+_FUSED = os.environ.get("VLLM_Q13_FUSED", "1") == "1"
+# Forensics: VLLM_Q13_CHECK=1 runs the fused kernel AND the unpack reference
+# on every fusable apply, logs each distinct (layer class, shape, batch)
+# signature once with its fused-vs-reference error, and returns the reference
+# so generation stays correct while the log maps where the fused glue breaks.
+_CHECK = os.environ.get("VLLM_Q13_CHECK", "0") == "1"
+# Forensics: VLLM_Q13_SYNC=1 synchronizes the device after every fused kernel
+# launch. If fused output is garbage without it and clean with it, the bug is
+# a stream/queue mismatch between the Triton launch and torch's ops, not math.
+_SYNC = os.environ.get("VLLM_Q13_SYNC", "0") == "1"
 
 try:
     import triton
     import triton.language as tl
+
+    # v3 kernels: bf16 x in its native (B, K) row-major layout, bf16 y written
+    # (B, M) row-major, B a RUNTIME arg with masked tail. The engine-side win
+    # is host overhead: no transpose/pad/convert copies per apply (6 extra XPU
+    # launches at v2) and no Triton recompile per distinct batch size.
 
     @triton.jit
     def _gemv_q13(sm32_ptr, nib32_ptr, hi32_ptr, lut_ptr, x_ptr, y_ptr,
@@ -84,16 +107,18 @@ try:
             e = tl.load(lut_ptr + ((i >> CHUNK_SHIFT) << 5) + idx)
             u = ((sm >> 7) << 15) | (e << 7) | (sm & 0x7F)
             wv = u.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
-            acc += wv * tl.load(x_ptr + k0 + tl.arange(0, BK))
-        tl.store(y_ptr + row, tl.sum(acc, axis=0))
+            xv = tl.load(x_ptr + k0 + tl.arange(0, BK)).to(tl.float32)
+            acc += wv * xv
+        tl.store(y_ptr + row, tl.sum(acc, axis=0).to(tl.bfloat16))
 
     @triton.jit
     def _gemm_q13(sm32_ptr, nib32_ptr, hi32_ptr, lut_ptr, x_ptr, y_ptr,
-                  K: tl.constexpr, B: tl.constexpr, BK: tl.constexpr,
+                  B, M, K: tl.constexpr, BK: tl.constexpr,
                   BN: tl.constexpr, CHUNK_SHIFT: tl.constexpr):
         row = tl.program_id(0)
         bb = tl.program_id(1)
         ob = bb * BN + tl.arange(0, BN)
+        bmask = ob < B
         acc = tl.zeros((BN,), tl.float32)
         for k0 in range(0, K, BK):
             base = row * K + k0
@@ -108,9 +133,44 @@ try:
             e = tl.load(lut_ptr + ((i >> CHUNK_SHIFT) << 5) + idx)
             u = ((sm >> 7) << 15) | (e << 7) | (sm & 0x7F)
             wv = u.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
-            xt = tl.load(x_ptr + (k0 + tl.arange(0, BK))[:, None] * B + ob[None, :])
+            xt = tl.load(x_ptr + ob[None, :] * K + (k0 + tl.arange(0, BK))[:, None],
+                         mask=bmask[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(wv[:, None] * xt, 0)
-        tl.store(y_ptr + row * B + ob, acc)
+        tl.store(y_ptr + ob * M + row, acc.to(tl.bfloat16), mask=bmask)
+
+    @triton.jit
+    def _gemm_q13_sb(sm32_ptr, nib32_ptr, hi32_ptr, lut_ptr, x_ptr, y_ptr,
+                     B, M, K: tl.constexpr, BK: tl.constexpr,
+                     BN: tl.constexpr, CHUNK_SHIFT: tl.constexpr):
+        # small-batch GEMM: GEMV register shape (one (BK,) weight vector),
+        # static loop over BN batch columns, scalar reduce per column folded
+        # into a (BN,) acc. Best measured small-B form on 7B shapes - the
+        # wide (BK, BN) tile variants go issue-bound and lose 3-5x.
+        row = tl.program_id(0)
+        bb = tl.program_id(1)
+        ob = bb * BN + tl.arange(0, BN)
+        acc = tl.zeros((BN,), tl.float32)
+        ktrue = tl.arange(0, BK) < K  # all-true tensor, carries scalar masks
+        for k0 in range(0, K, BK):
+            base = row * K + k0
+            i = base + tl.arange(0, BK)
+            w4 = tl.load(sm32_ptr + (base >> 2) + tl.arange(0, BK // 4))
+            sm = tl.reshape(w4[:, None] >> ((tl.arange(0, 4) * 8)[None, :]), (BK,)) & 0xFF
+            w8 = tl.load(nib32_ptr + (base >> 3) + tl.arange(0, BK // 8))
+            nb = tl.reshape(w8[:, None] >> ((tl.arange(0, 8) * 4)[None, :]), (BK,)) & 0xF
+            w32 = tl.load(hi32_ptr + (base >> 5) + tl.arange(0, BK // 32))
+            hb = tl.reshape(w32[:, None] >> (tl.arange(0, 32)[None, :]), (BK,)) & 1
+            idx = nb | (hb << 4)
+            e = tl.load(lut_ptr + ((i >> CHUNK_SHIFT) << 5) + idx)
+            u = ((sm >> 7) << 15) | (e << 7) | (sm & 0x7F)
+            wv = u.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+            for b in tl.static_range(BN):
+                ob_b = bb * BN + b
+                xb = tl.load(x_ptr + ob_b * K + k0 + tl.arange(0, BK),
+                             mask=ktrue & (ob_b < B), other=0.0).to(tl.float32)
+                s = tl.sum(wv * xb, 0)
+                acc = tl.where(tl.arange(0, BN) == b, acc + s, acc)
+        tl.store(y_ptr + ob * M + row, acc.to(tl.bfloat16), mask=ob < B)
 
     _HAVE_TRITON = True
 except Exception:  # pragma: no cover - triton missing
@@ -208,35 +268,78 @@ class Q13LinearMethod(UnquantizedLinearMethod):
         layer.q13_lutflat = luts.reshape(-1).contiguous()
         M, Kd = shape
         layer.q13_fusable = (
-            _HAVE_TRITON and _FUSED and Kd % 128 == 0 and (M * Kd) % 32 == 0
+            _HAVE_TRITON
+            and (_FUSED or _CHECK)
+            and Kd % 128 == 0
+            and (M * Kd) % 32 == 0
         )
 
     def _apply_fused(self, layer, x, bias):
         M, K = layer.q13_shape
         xs = x.reshape(-1, K)
+        if not xs.is_contiguous():
+            xs = xs.contiguous()
         B = xs.shape[0]
+        # y is written (B, M) row-major by the kernel itself: downstream
+        # custom ops (silu_and_mul, attention) read raw pointers assuming
+        # row-major, so the output must be truly contiguous, not a view.
+        y = torch.empty(B, M, dtype=torch.bfloat16, device=x.device)
         if B == 1:
-            x32 = xs[0].to(torch.float32)
-            y = torch.empty(M, dtype=torch.float32, device=x.device)
+            # BK: largest tile dividing K. Measured on 7B tensors (BK=512,
+            # warps=2): gate 1.10x / down 1.03x vs F.linear bf16; BK=128
+            # leaves ~20% on the table on big-K shapes.
+            BKv = 512 if K % 512 == 0 else (256 if K % 256 == 0 else 128)
             _gemv_q13[(M,)](layer.q13_sm32, layer.q13_nib32, layer.q13_hi32,
-                            layer.q13_lutflat, x32, y,
-                            K=K, BK=128, CHUNK_SHIFT=CHUNK_SHIFT, num_warps=2)
-            out = y.unsqueeze(0)
+                            layer.q13_lutflat, xs, y,
+                            K=K, BK=BKv, CHUNK_SHIFT=CHUNK_SHIFT, num_warps=2)
+        elif B < 32:
+            # small-batch decode: GEMV-shaped kernel, BK as in the GEMV
+            BKv = 512 if K % 512 == 0 else (256 if K % 256 == 0 else 128)
+            _gemm_q13_sb[(M, (B + 3) // 4)](
+                layer.q13_sm32, layer.q13_nib32, layer.q13_hi32,
+                layer.q13_lutflat, xs, y, B, M,
+                K=K, BK=BKv, BN=4, CHUNK_SHIFT=CHUNK_SHIFT, num_warps=2)
         else:
-            BN = 32 if B >= 32 else 8
-            Bp = ((B + BN - 1) // BN) * BN
-            xT = torch.zeros(K, Bp, dtype=torch.float32, device=x.device)
-            xT[:, :B] = xs.t().to(torch.float32)
-            y = torch.empty(M * Bp, dtype=torch.float32, device=x.device)
-            _gemm_q13[(M, Bp // BN)](layer.q13_sm32, layer.q13_nib32,
-                                     layer.q13_hi32, layer.q13_lutflat, xT, y,
-                                     K=K, B=Bp, BK=128, BN=BN,
-                                     CHUNK_SHIFT=CHUNK_SHIFT, num_warps=2)
-            out = y.reshape(M, Bp)[:, :B].t()
-        out = out.to(x.dtype)
-        if bias is not None:
-            out = out + bias
+            _gemm_q13[(M, (B + 31) // 32)](
+                layer.q13_sm32, layer.q13_nib32, layer.q13_hi32,
+                layer.q13_lutflat, xs, y, B, M,
+                K=K, BK=128, BN=32, CHUNK_SHIFT=CHUNK_SHIFT, num_warps=2)
+        if _SYNC:
+            torch.xpu.synchronize()
+        out = y if bias is None else y + bias
         return out.reshape(*x.shape[:-1], M)
+
+    _check_seen: dict = {}
+
+    def _apply_checked(self, layer, x, bias):
+        fused = self._apply_fused(layer, x, bias)
+        w = _unpack_q13(
+            layer.q13_sm, layer.q13_nib, layer.q13_hi,
+            layer.q13_luts, layer.q13_n, layer.q13_shape,
+        )
+        ref = self._gemm_impl(layer, x, w, bias)
+        M, K = layer.q13_shape
+        B = x.reshape(-1, K).shape[0]
+        key = (type(layer).__name__, M, K, B)
+        # compare EVERY call: a first-call-only compare hides launcher/JIT
+        # bugs that appear once the compiled kernel is reused from cache
+        d = (fused.float() - ref.float()).abs().max().item()
+        s = ref.float().abs().max().clamp_min(1e-9).item()
+        rel = d / s
+        seen = Q13LinearMethod._check_seen
+        prev, calls = seen.get(key, (-1.0, 0))
+        seen[key] = (max(prev, rel), calls + 1)
+        if prev < 0 or (rel > 1e-2 and rel > prev * 10):
+            logger.info(
+                "Q13 CHECK %s M=%d K=%d B=%d call#%d rel=%.2e%s | x dtype=%s "
+                "contig=%s shape=%s stride=%s bias=%s fused_shape=%s",
+                key[0], M, K, B, calls + 1, rel,
+                " **DIVERGES**" if rel > 1e-2 else "",
+                x.dtype, x.is_contiguous(), tuple(x.shape), tuple(x.stride()),
+                "none" if bias is None else tuple(bias.shape),
+                tuple(fused.shape),
+            )
+        return ref
 
     def apply(
         self,
@@ -247,6 +350,8 @@ class Q13LinearMethod(UnquantizedLinearMethod):
         if not hasattr(layer, "q13_sm"):  # non-bf16 layer: stock path
             return super().apply(layer, x, bias)
         if getattr(layer, "q13_fusable", False):
+            if _CHECK:
+                return self._apply_checked(layer, x, bias)
             return self._apply_fused(layer, x, bias)
         w = _unpack_q13(
             layer.q13_sm, layer.q13_nib, layer.q13_hi,
