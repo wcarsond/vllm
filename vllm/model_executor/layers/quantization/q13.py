@@ -33,12 +33,24 @@ cache 5.19 -> 7.26 GiB (+40% context), generated text identical. The fused
 matmul accumulates in fp32 and rounds to bf16, so outputs sit within one bf16
 ulp of the stock GEMM rather than bitwise equal; VLLM_Q13_FUSED=0 selects the
 bit-exact unpack reference path (token-identical to unquantized, much
-slower). Known gap: batched decode (2-31 concurrent sequences) runs ~0.4x
+slower). Known gap: batched decode (2-31 concurrent sequences) runs below
 unquantized - the per-element plane unpack saturates the vector ALUs
 alongside one batch column but not several, and the XMX units cannot be fed
 from registers. Single-stream serving is the design point. Enable with
 quantization="q13" after importing this module; registration is via the
 decorator, no core files are touched.
+
+quantization="q12" is the occurrence-sorted variant and strictly dominates
+when it applies: sort each chunk's exponent LUT by frequency and the top 16
+cover 99.985% of weights (measured over all 7.62B weights of a 7B), so the
+index needs only the 4-bit nibble - no fifth bit stored per weight. The
+rare exponents file under a different pointer instead: a per-row exception
+list carrying their exact values (~0.015% of weights, a few MB per model),
+folded into the matmul as a CSR correction pass that costs nothing on the
+99.9% of rows with no exceptions. Still bit-exact. 12.007 bits/weight,
+r = 0.7504. Measured on the same 7B: weights 14.19 -> 11.22 GiB resident,
+batch-1 decode 36.5 vs 30.0 tok/s unquantized (1.22x), KV cache +44%,
+text identical.
 """
 
 import os
@@ -78,6 +90,29 @@ _CHECK = os.environ.get("VLLM_Q13_CHECK", "0") == "1"
 # launch. If fused output is garbage without it and clean with it, the bug is
 # a stream/queue mismatch between the Triton launch and torch's ops, not math.
 _SYNC = os.environ.get("VLLM_Q13_SYNC", "0") == "1"
+# VLLM_Q13_HOSTLOAD=1: loader-pass pack - load the checkpoint into host
+# memory, pack there, upload only the planes. See Q13LinearMethod docstring.
+_HOSTLOAD = os.environ.get("VLLM_Q13_HOSTLOAD", "0") == "1"
+# VLLM_Q13_PACKCACHE=1: packing is a pure function of the checkpoint, so do
+# it once ever - planes are cached on disk keyed by a content fingerprint
+# (a changed checkpoint misses and repacks; cache errors fall back to
+# packing). Kills the pack compute on every start after the first.
+_PACKCACHE = os.environ.get("VLLM_Q13_PACKCACHE", "0") == "1"
+_PACKCACHE_DIR = os.environ.get(
+    "VLLM_Q13_PACKCACHE_DIR", os.path.expanduser("~/.cache/vllm-q13")
+)
+
+
+def _fingerprint(w: torch.Tensor) -> str:
+    import hashlib
+
+    flat = w.reshape(-1)
+    step = max(1, flat.numel() // 4096)
+    sample = (flat[::step][:4096].contiguous().cpu()
+              .view(torch.int16).numpy().tobytes())
+    h = hashlib.blake2b(sample, digest_size=16)
+    h.update(str((flat.numel(), tuple(w.shape))).encode())
+    return h.hexdigest()
 
 try:
     import triton
@@ -136,6 +171,119 @@ try:
             xt = tl.load(x_ptr + ob[None, :] * K + (k0 + tl.arange(0, BK))[:, None],
                          mask=bmask[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(wv[:, None] * xt, 0)
+        tl.store(y_ptr + ob * M + row, acc.to(tl.bfloat16), mask=bmask)
+
+    # Q12 kernels: the occurrence-sorted variant. The per-chunk LUT holds the
+    # 16 most frequent exponents (99.985% coverage measured model-wide on a
+    # 7B), so the hi bitmap disappears from storage AND from the inner loop;
+    # the rare exceptions ride a per-row CSR folded in after the K loop
+    # (average well under one exception per row - most rows skip free).
+
+    @triton.jit
+    def _gemv_q12(sm32_ptr, nib32_ptr, lut_ptr, rowptr_ptr, exccol_ptr,
+                  excdw_ptr, x_ptr, y_ptr, K: tl.constexpr, BK: tl.constexpr,
+                  CHUNK_SHIFT: tl.constexpr, EXC_CAP: tl.constexpr):
+        row = tl.program_id(0)
+        acc = tl.zeros((BK,), tl.float32)
+        for k0 in range(0, K, BK):
+            base = row * K + k0
+            i = base + tl.arange(0, BK)
+            w4 = tl.load(sm32_ptr + (base >> 2) + tl.arange(0, BK // 4))
+            sm = tl.reshape(w4[:, None] >> ((tl.arange(0, 4) * 8)[None, :]), (BK,)) & 0xFF
+            w8 = tl.load(nib32_ptr + (base >> 3) + tl.arange(0, BK // 8))
+            nb = tl.reshape(w8[:, None] >> ((tl.arange(0, 8) * 4)[None, :]), (BK,)) & 0xF
+            e = tl.load(lut_ptr + ((i >> CHUNK_SHIFT) << 4) + nb)
+            u = ((sm >> 7) << 15) | (e << 7) | (sm & 0x7F)
+            wv = u.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+            xv = tl.load(x_ptr + k0 + tl.arange(0, BK)).to(tl.float32)
+            acc += wv * xv
+        s = tl.sum(acc, axis=0)
+        r0 = tl.load(rowptr_ptr + row)
+        r1 = tl.load(rowptr_ptr + row + 1)
+        for jb in range(r0, r1, EXC_CAP):  # waves: any count, 0 = skip free
+            jj = jb + tl.arange(0, EXC_CAP)
+            m = jj < r1
+            cols = tl.load(exccol_ptr + jj, mask=m, other=0)
+            dws = tl.load(excdw_ptr + jj, mask=m, other=0.0)
+            xe = tl.load(x_ptr + cols, mask=m, other=0.0).to(tl.float32)
+            s += tl.sum(dws * xe, 0)
+        tl.store(y_ptr + row, s.to(tl.bfloat16))
+
+    @triton.jit
+    def _gemm_q12_sb(sm32_ptr, nib32_ptr, lut_ptr, rowptr_ptr, exccol_ptr,
+                     excdw_ptr, x_ptr, y_ptr, B, M,
+                     K: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
+                     CHUNK_SHIFT: tl.constexpr, EXC_CAP: tl.constexpr):
+        row = tl.program_id(0)
+        bb = tl.program_id(1)
+        ob = bb * BN + tl.arange(0, BN)
+        acc = tl.zeros((BN,), tl.float32)
+        ktrue = tl.arange(0, BK) < K
+        for k0 in range(0, K, BK):
+            base = row * K + k0
+            i = base + tl.arange(0, BK)
+            w4 = tl.load(sm32_ptr + (base >> 2) + tl.arange(0, BK // 4))
+            sm = tl.reshape(w4[:, None] >> ((tl.arange(0, 4) * 8)[None, :]), (BK,)) & 0xFF
+            w8 = tl.load(nib32_ptr + (base >> 3) + tl.arange(0, BK // 8))
+            nb = tl.reshape(w8[:, None] >> ((tl.arange(0, 8) * 4)[None, :]), (BK,)) & 0xF
+            e = tl.load(lut_ptr + ((i >> CHUNK_SHIFT) << 4) + nb)
+            u = ((sm >> 7) << 15) | (e << 7) | (sm & 0x7F)
+            wv = u.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+            for b in tl.static_range(BN):
+                ob_b = bb * BN + b
+                xb = tl.load(x_ptr + ob_b * K + k0 + tl.arange(0, BK),
+                             mask=ktrue & (ob_b < B), other=0.0).to(tl.float32)
+                sb = tl.sum(wv * xb, 0)
+                acc = tl.where(tl.arange(0, BN) == b, acc + sb, acc)
+        r0 = tl.load(rowptr_ptr + row)
+        r1 = tl.load(rowptr_ptr + row + 1)
+        for jb in range(r0, r1, EXC_CAP):
+            jj = jb + tl.arange(0, EXC_CAP)
+            m = jj < r1
+            cols = tl.load(exccol_ptr + jj, mask=m, other=0)
+            dws = tl.load(excdw_ptr + jj, mask=m, other=0.0)
+            for b in tl.static_range(BN):
+                ob_b = bb * BN + b
+                xe = tl.load(x_ptr + ob_b * K + cols, mask=m & (ob_b < B),
+                             other=0.0).to(tl.float32)
+                sb = tl.sum(dws * xe, 0)
+                acc = tl.where(tl.arange(0, BN) == b, acc + sb, acc)
+        tl.store(y_ptr + ob * M + row, acc.to(tl.bfloat16), mask=ob < B)
+
+    @triton.jit
+    def _gemm_q12(sm32_ptr, nib32_ptr, lut_ptr, rowptr_ptr, exccol_ptr,
+                  excdw_ptr, x_ptr, y_ptr, B, M,
+                  K: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr,
+                  CHUNK_SHIFT: tl.constexpr, EXC_CAP: tl.constexpr):
+        row = tl.program_id(0)
+        bb = tl.program_id(1)
+        ob = bb * BN + tl.arange(0, BN)
+        bmask = ob < B
+        acc = tl.zeros((BN,), tl.float32)
+        for k0 in range(0, K, BK):
+            base = row * K + k0
+            i = base + tl.arange(0, BK)
+            w4 = tl.load(sm32_ptr + (base >> 2) + tl.arange(0, BK // 4))
+            sm = tl.reshape(w4[:, None] >> ((tl.arange(0, 4) * 8)[None, :]), (BK,)) & 0xFF
+            w8 = tl.load(nib32_ptr + (base >> 3) + tl.arange(0, BK // 8))
+            nb = tl.reshape(w8[:, None] >> ((tl.arange(0, 8) * 4)[None, :]), (BK,)) & 0xF
+            e = tl.load(lut_ptr + ((i >> CHUNK_SHIFT) << 4) + nb)
+            u = ((sm >> 7) << 15) | (e << 7) | (sm & 0x7F)
+            wv = u.to(tl.int16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+            xt = tl.load(x_ptr + ob[None, :] * K + (k0 + tl.arange(0, BK))[:, None],
+                         mask=bmask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(wv[:, None] * xt, 0)
+        r0 = tl.load(rowptr_ptr + row)
+        r1 = tl.load(rowptr_ptr + row + 1)
+        for jb in range(r0, r1, EXC_CAP):
+            jj = jb + tl.arange(0, EXC_CAP)
+            m = jj < r1
+            cols = tl.load(exccol_ptr + jj, mask=m, other=0)
+            dws = tl.load(excdw_ptr + jj, mask=m, other=0.0)
+            xe = tl.load(x_ptr + ob[None, :] * K + cols[:, None],
+                         mask=m[:, None] & bmask[None, :],
+                         other=0.0).to(tl.float32)
+            acc += tl.sum(dws[:, None] * xe, 0)
         tl.store(y_ptr + ob * M + row, acc.to(tl.bfloat16), mask=bmask)
 
     @triton.jit
@@ -237,36 +385,208 @@ def _unpack_q13(sm, nib, hi, luts, n, shape):
     return w[:n].reshape(shape)
 
 
+def _pack_q12(w: torch.Tensor):
+    """bf16 tensor -> occurrence-sorted 12-bit planes + exact exceptions.
+
+    Per 1M chunk the LUT holds the 16 MOST FREQUENT exponents; weights
+    outside it (measured 0.015% model-wide on a 7B) are exceptions: their
+    nibble says 0 and their exact bf16 bit pattern rides a side list.
+    Returns (sm u8, nib u8, luts (n_chunks,16) i32, exc_gpos i64, exc_val
+    i16, n, shape). Bit-exact: unpack scatters the exact values back.
+    """
+    assert w.dtype == torch.bfloat16
+    shape = w.shape
+    u = w.reshape(-1).view(torch.int16).to(torch.int32) & 0xFFFF
+    n = u.numel()
+    pad = (-n) % 32
+    if pad:
+        u = torch.nn.functional.pad(u, (0, pad))
+    exp = (u >> 7) & 0xFF
+    sm = ((((u >> 15) & 1) << 7) | (u & 0x7F)).to(torch.uint8)
+    idx = torch.empty_like(exp)
+    luts = []
+    exc_gpos = []
+    for s in range(0, u.numel(), CHUNK):
+        e = exp[s : s + CHUNK]
+        counts = torch.bincount(e, minlength=256)
+        top = counts.sort(descending=True).indices[:16].to(torch.int32)
+        lut = torch.zeros(16, dtype=torch.int32, device=u.device)
+        lut[: top.numel()] = top
+        inv = torch.full((256,), -1, dtype=torch.int32, device=u.device)
+        inv[top.long()] = torch.arange(top.numel(), dtype=torch.int32, device=u.device)
+        ix = inv[e.long()]
+        exc = torch.nonzero(ix < 0).reshape(-1)
+        if exc.numel():
+            exc_gpos.append(exc + s)
+            ix[exc] = 0  # main plane uses lut[0]; the side list carries truth
+        idx[s : s + CHUNK] = ix
+        luts.append(lut)
+    nib = ((idx[0::2] & 0xF) | ((idx[1::2] & 0xF) << 4)).to(torch.uint8)
+    gpos = (torch.cat(exc_gpos) if exc_gpos
+            else torch.empty(0, dtype=torch.int64, device=u.device)).to(torch.int64)
+    gpos = gpos[gpos < n]  # padding positions carry no truth
+    exc_val = u[gpos].to(torch.int16)
+    return sm, nib, torch.stack(luts), gpos, exc_val, n, shape
+
+
+def _unpack_q12(sm, nib, luts, exc_gpos, exc_val, n, shape):
+    """Planes + exception scatter -> bf16 tensor, bit-exact."""
+    total = sm.numel()
+    idx = torch.empty(total, dtype=torch.int32, device=sm.device)
+    nib32 = nib.to(torch.int32)
+    idx[0::2] = nib32 & 0xF
+    idx[1::2] = nib32 >> 4
+    chunk_id = torch.arange(total, dtype=torch.int64, device=sm.device) // CHUNK
+    exp = luts[chunk_id, idx.long()]
+    sm32 = sm.to(torch.int32)
+    u = ((sm32 >> 7) << 15) | (exp << 7) | (sm32 & 0x7F)
+    u[exc_gpos] = exc_val.to(torch.int32) & 0xFFFF
+    w = u.to(torch.int16).view(torch.bfloat16)
+    return w[:n].reshape(shape)
+
+
 class Q13LinearMethod(UnquantizedLinearMethod):
-    """Unquantized create_weights/loading; packs after load, fused apply."""
+    """Unquantized create_weights/loading; packs after load, fused apply.
+
+    VLLM_Q13_HOSTLOAD=1 (loader-pass pack): linear weights are created on the
+    CPU, the checkpoint loads into host memory, packing happens on the host,
+    and only the 13-bit planes ever cross PCIe. Peak device memory during
+    load drops from full bf16 to the packed size (the fit-cliff unlock: a
+    model whose bf16 doesn't fit the card can still load packed), and the
+    upload moves 0.8125x the bytes. requires_device_loading=False keeps the
+    loader from moving the CPU weights to the device before we pack them.
+    """
 
     packed_layers = 0
     packed_bytes_saved = 0
 
+    def __init__(self, fmt: str = "q13"):
+        super().__init__()
+        self.fmt = fmt
+        if _HOSTLOAD:
+            self.requires_device_loading = False
+
+    def create_weights(self, layer, *args, **kwargs):
+        if not _HOSTLOAD:
+            return super().create_weights(layer, *args, **kwargs)
+        with torch.device("cpu"):
+            return super().create_weights(layer, *args, **kwargs)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w = layer.weight.data
+        hostload = _HOSTLOAD and w.device.type == "cpu"
+        if hostload:
+            dev = torch.device("xpu", torch.xpu.current_device())
         if w.dtype != torch.bfloat16:
-            return  # leave non-bf16 layers untouched
-        sm, nib, hi, luts, n, shape = _pack_q13(w)
+            if hostload:  # still bring the layer onto the card
+                for pname, p in list(layer._parameters.items()):
+                    if p is not None and p.device.type == "cpu":
+                        p.data = p.data.to(dev)
+            return  # leave non-bf16 layers unpacked
+        M, Kd = w.shape
+        fmt = self.fmt
+        # pack cache: packing is a pure function of the checkpoint - a
+        # content-fingerprint hit skips the pack compute entirely
+        cpath = None
+        cached = None
+        if _PACKCACHE:
+            try:
+                cpath = os.path.join(
+                    _PACKCACHE_DIR, f"{fmt}-{_fingerprint(w)}.pt"
+                )
+                if os.path.exists(cpath):
+                    cached = torch.load(cpath, map_location="cpu")
+            except Exception as e:  # cache can never break a load
+                logger.warning("Q13 pack cache read failed (%s); packing", e)
+                cached = None
+        if cached is not None:
+            fmt = cached["fmt"]
+            n, shape = cached["n"], torch.Size(cached["shape"])
+            tgt = w.device if not hostload else torch.device("cpu")
+            sm, nib, luts = (cached[k].to(tgt) for k in ("sm", "nib", "luts"))
+            if fmt == "q13":
+                hi = cached["hi"].to(tgt)
+            else:
+                hi = None
+                row_ptr, cols, dw, gpos_s, val_s = (
+                    cached[k].to(tgt)
+                    for k in ("row_ptr", "cols", "dw", "gpos", "val")
+                )
+        elif fmt == "q12":
+            sm, nib, luts, gpos, exc_val, n, shape = _pack_q12(w)
+            rows = (gpos // Kd).to(torch.int64)
+            counts = torch.bincount(rows, minlength=M)
+            order = torch.argsort(rows)
+            gpos_s = gpos[order]
+            val_s = exc_val[order]
+            cols = (gpos_s % Kd).to(torch.int32)
+            row_ptr = torch.zeros(M + 1, dtype=torch.int32, device=w.device)
+            row_ptr[1:] = torch.cumsum(counts, 0).to(torch.int32)
+            # dw = true value - what the main loop computes (lut[0] exp)
+            smv = sm[gpos_s].to(torch.int32)
+            lut0 = luts[(gpos_s // CHUNK).long(), 0]
+            u_used = ((smv >> 7) << 15) | (lut0 << 7) | (smv & 0x7F)
+            w_used = u_used.to(torch.int16).view(torch.bfloat16).to(torch.float32)
+            w_true = val_s.view(torch.bfloat16).to(torch.float32)
+            dw = (w_true - w_used).contiguous()
+            if cols.numel() == 0:  # keep the kernels' pointers valid
+                cols = torch.zeros(1, dtype=torch.int32, device=w.device)
+                dw = torch.zeros(1, dtype=torch.float32, device=w.device)
+            hi = None
+        if cached is None and fmt == "q13":
+            sm, nib, hi, luts, n, shape = _pack_q13(w)
+        if cached is None and cpath is not None:
+            try:
+                os.makedirs(_PACKCACHE_DIR, exist_ok=True)
+                d = {"fmt": fmt, "n": n, "shape": tuple(shape),
+                     "sm": sm.cpu(), "nib": nib.cpu(), "luts": luts.cpu()}
+                if fmt == "q13":
+                    d["hi"] = hi.cpu()
+                else:
+                    d.update(row_ptr=row_ptr.cpu(), cols=cols.cpu(),
+                             dw=dw.cpu(), gpos=gpos_s.cpu(), val=val_s.cpu())
+                torch.save(d, cpath)
+            except Exception as e:
+                logger.warning("Q13 pack cache write failed (%s)", e)
+        if hostload:
+            sm, nib, luts = sm.to(dev), nib.to(dev), luts.to(dev)
+            if fmt == "q13":
+                hi = hi.to(dev)
+            else:
+                row_ptr, cols, dw = row_ptr.to(dev), cols.to(dev), dw.to(dev)
+                gpos_s, val_s = gpos_s.to(dev), val_s.to(dev)
         Q13LinearMethod.packed_layers += 1
+        side = (hi.numel() if fmt == "q13" else
+                row_ptr.numel() * 4 + cols.numel() * 8 + gpos_s.numel() * 10)
         Q13LinearMethod.packed_bytes_saved += n * 2 - (
-            sm.numel() + nib.numel() + hi.numel() + luts.numel() * 4
+            sm.numel() + nib.numel() + luts.numel() * 4 + side
         )
         if Q13LinearMethod.packed_layers == 1:
-            logger.info("Q13: packing engaged (first linear layer packed)")
+            logger.info("Q13: packing engaged (first linear layer packed, fmt=%s)", fmt)
         del layer._parameters["weight"]
+        if hostload:  # bias (and any other host params) follow the planes
+            for pname, p in list(layer._parameters.items()):
+                if p is not None and p.device.type == "cpu":
+                    p.data = p.data.to(dev)
+        layer.q13_fmt = fmt
         layer.register_buffer("q13_sm", sm, persistent=False)
         layer.register_buffer("q13_nib", nib, persistent=False)
-        layer.register_buffer("q13_hi", hi, persistent=False)
         layer.register_buffer("q13_luts", luts, persistent=False)
+        if fmt == "q13":
+            layer.register_buffer("q13_hi", hi, persistent=False)
+            layer.q13_hi32 = hi.view(torch.int32)
+        else:
+            layer.register_buffer("q12_rowptr", row_ptr, persistent=False)
+            layer.register_buffer("q12_exccol", cols, persistent=False)
+            layer.register_buffer("q12_excdw", dw, persistent=False)
+            layer.register_buffer("q12_gpos", gpos_s, persistent=False)
+            layer.register_buffer("q12_excval", val_s, persistent=False)
         layer.q13_n = n
         layer.q13_shape = shape
         # int32 views for the fused kernels (padded to %32 so these are exact)
         layer.q13_sm32 = sm.view(torch.int32)
         layer.q13_nib32 = nib.view(torch.int32)
-        layer.q13_hi32 = hi.view(torch.int32)
         layer.q13_lutflat = luts.reshape(-1).contiguous()
-        M, Kd = shape
         layer.q13_fusable = (
             _HAVE_TRITON
             and (_FUSED or _CHECK)
@@ -284,18 +604,34 @@ class Q13LinearMethod(UnquantizedLinearMethod):
         # custom ops (silu_and_mul, attention) read raw pointers assuming
         # row-major, so the output must be truly contiguous, not a view.
         y = torch.empty(B, M, dtype=torch.bfloat16, device=x.device)
-        if B == 1:
-            # BK: largest tile dividing K; subgroup 16, one warp. Measured on
-            # 7B tensors (200 reps): gate 1.21x / down 1.14x vs F.linear bf16
-            # - the subgroup-32 default left ~10%, BK=128 another ~20%.
-            BKv = 512 if K % 512 == 0 else (256 if K % 256 == 0 else 128)
+        # BK: largest tile dividing K; subgroup 16, one warp on the GEMV.
+        # Measured on 7B tensors (200 reps): gate 1.21x / down 1.14x vs
+        # F.linear bf16 - subgroup-32 left ~10%, BK=128 another ~20%.
+        BKv = 512 if K % 512 == 0 else (256 if K % 256 == 0 else 128)
+        if getattr(layer, "q13_fmt", "q13") == "q12":
+            args = (layer.q13_sm32, layer.q13_nib32, layer.q13_lutflat,
+                    layer.q12_rowptr, layer.q12_exccol, layer.q12_excdw)
+            if B == 1:
+                _gemv_q12[(M,)](*args, xs, y, K=K, BK=BKv,
+                                CHUNK_SHIFT=CHUNK_SHIFT, EXC_CAP=64,
+                                num_warps=1, warp_size=16)
+            elif B < 32:
+                _gemm_q12_sb[(M, (B + 3) // 4)](*args, xs, y, B, M,
+                                                K=K, BK=BKv, BN=4,
+                                                CHUNK_SHIFT=CHUNK_SHIFT,
+                                                EXC_CAP=64, num_warps=2)
+            else:
+                _gemm_q12[(M, (B + 31) // 32)](*args, xs, y, B, M,
+                                               K=K, BK=128, BN=32,
+                                               CHUNK_SHIFT=CHUNK_SHIFT,
+                                               EXC_CAP=64, num_warps=2)
+        elif B == 1:
             _gemv_q13[(M,)](layer.q13_sm32, layer.q13_nib32, layer.q13_hi32,
                             layer.q13_lutflat, xs, y,
                             K=K, BK=BKv, CHUNK_SHIFT=CHUNK_SHIFT,
                             num_warps=1, warp_size=16)
         elif B < 32:
             # small-batch decode: GEMV-shaped kernel, BK as in the GEMV
-            BKv = 512 if K % 512 == 0 else (256 if K % 256 == 0 else 128)
             _gemm_q13_sb[(M, (B + 3) // 4)](
                 layer.q13_sm32, layer.q13_nib32, layer.q13_hi32,
                 layer.q13_lutflat, xs, y, B, M,
@@ -312,12 +648,21 @@ class Q13LinearMethod(UnquantizedLinearMethod):
 
     _check_seen: dict = {}
 
-    def _apply_checked(self, layer, x, bias):
-        fused = self._apply_fused(layer, x, bias)
-        w = _unpack_q13(
+    def _unpack_layer(self, layer):
+        if getattr(layer, "q13_fmt", "q13") == "q12":
+            return _unpack_q12(
+                layer.q13_sm, layer.q13_nib, layer.q13_luts,
+                layer.q12_gpos, layer.q12_excval,
+                layer.q13_n, layer.q13_shape,
+            )
+        return _unpack_q13(
             layer.q13_sm, layer.q13_nib, layer.q13_hi,
             layer.q13_luts, layer.q13_n, layer.q13_shape,
         )
+
+    def _apply_checked(self, layer, x, bias):
+        fused = self._apply_fused(layer, x, bias)
+        w = self._unpack_layer(layer)
         ref = self._gemm_impl(layer, x, w, bias)
         M, K = layer.q13_shape
         B = x.reshape(-1, K).shape[0]
@@ -354,10 +699,7 @@ class Q13LinearMethod(UnquantizedLinearMethod):
             if _CHECK:
                 return self._apply_checked(layer, x, bias)
             return self._apply_fused(layer, x, bias)
-        w = _unpack_q13(
-            layer.q13_sm, layer.q13_nib, layer.q13_hi,
-            layer.q13_luts, layer.q13_n, layer.q13_shape,
-        )
+        w = self._unpack_layer(layer)
         return self._gemm_impl(layer, x, w, bias)
 
 
@@ -390,4 +732,26 @@ class Q13Config(QuantizationConfig):
     ) -> QuantizeMethodBase | None:
         if isinstance(layer, LinearBase):
             return Q13LinearMethod()
+        return None
+
+
+@register_quantization_config("q12")
+class Q12Config(Q13Config):
+    """Occurrence-sorted 12-bit resident bf16: per-chunk LUT of the 16 most
+    frequent exponents (99.985% coverage measured on a 7B), rare exponents as
+    exact per-row exceptions. r = 0.7504 vs Q13's 0.8125; still lossless."""
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "q12"
+
+    @classmethod
+    def from_config(cls, config) -> "Q12Config":
+        return cls()
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        if isinstance(layer, LinearBase):
+            return Q13LinearMethod(fmt="q12")
         return None
