@@ -285,13 +285,14 @@ class Q13LinearMethod(UnquantizedLinearMethod):
         # row-major, so the output must be truly contiguous, not a view.
         y = torch.empty(B, M, dtype=torch.bfloat16, device=x.device)
         if B == 1:
-            # BK: largest tile dividing K. Measured on 7B tensors (BK=512,
-            # warps=2): gate 1.10x / down 1.03x vs F.linear bf16; BK=128
-            # leaves ~20% on the table on big-K shapes.
+            # BK: largest tile dividing K; subgroup 16, one warp. Measured on
+            # 7B tensors (200 reps): gate 1.21x / down 1.14x vs F.linear bf16
+            # - the subgroup-32 default left ~10%, BK=128 another ~20%.
             BKv = 512 if K % 512 == 0 else (256 if K % 256 == 0 else 128)
             _gemv_q13[(M,)](layer.q13_sm32, layer.q13_nib32, layer.q13_hi32,
                             layer.q13_lutflat, xs, y,
-                            K=K, BK=BKv, CHUNK_SHIFT=CHUNK_SHIFT, num_warps=2)
+                            K=K, BK=BKv, CHUNK_SHIFT=CHUNK_SHIFT,
+                            num_warps=1, warp_size=16)
         elif B < 32:
             # small-batch decode: GEMV-shaped kernel, BK as in the GEMV
             BKv = 512 if K % 512 == 0 else (256 if K % 256 == 0 else 128)
