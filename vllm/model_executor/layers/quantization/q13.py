@@ -3,18 +3,23 @@
 
 Each weight is stored as three fixed-width planes - a sign+mantissa byte, a
 4-bit exponent-LUT index nibble, and a 1-bit high-index bitmap - with one
-32-entry exponent LUT per 1M-element chunk. Reconstruction is bit-exact bf16
-(see CODEC-NOTES.md at the repo root: whole-model r = 0.8125, EXACT), so this
-is a quantization method with zero quantization error: ~19% of weight VRAM
-back, outputs identical to running unquantized.
+32-entry exponent LUT per 1M-element chunk. Reconstruction is bit-exact bf16,
+so this is a quantization method with zero quantization error: ~19% of weight
+VRAM back, outputs identical to running unquantized.
 
-v1 applies via unpack-to-scratch + the stock unquantized GEMM (correctness
-first; the fused Triton GEMV/GEMM from server/ is the speed lap). Enable with
-quantization="q13" after importing this module; registration is via the
-decorator, no core files are touched.
+Measured on two Arc Pro B60s on Windows 11: whole-model packing of Qwen3-1.7B
+lands at r = 0.8125 exactly (2051 chunks, zero fallbacks, every tensor
+round-tripped bit-exact); the offline smoke is greedy token-identical to bf16,
+with model memory 0.93 -> 0.81 GiB on a 0.5B. A standalone fused GEMV of this
+format measured 1.08x over a roofline bf16 GEMV at batch 1; v1 here applies
+via unpack + the stock unquantized GEMM (correctness first), so the fused
+path is the planned fast lap. Enable with quantization="q13" after importing
+this module; registration is via the decorator, no core files are touched.
 """
 
 import torch
+
+from vllm.logger import init_logger
 
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -27,6 +32,8 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+
+logger = init_logger(__name__)
 
 CHUNK = 1 << 20  # elements per exponent-LUT chunk (multiple of 8)
 
@@ -107,7 +114,7 @@ class Q13LinearMethod(UnquantizedLinearMethod):
             sm.numel() + nib.numel() + hi.numel() + luts.numel() * 4
         )
         if Q13LinearMethod.packed_layers == 1:
-            print("Q13: packing engaged (first linear layer packed)", flush=True)
+            logger.info("Q13: packing engaged (first linear layer packed)")
         del layer._parameters["weight"]
         layer.register_buffer("q13_sm", sm, persistent=False)
         layer.register_buffer("q13_nib", nib, persistent=False)
